@@ -40,6 +40,9 @@ struct llama_cparams {
     bool kv_unified;
     bool pipeline_parallel;
 
+    uint32_t moe_hot_k;                  // MoE hot expert cache size (0 = disabled)
+    uint32_t moe_hot_rebalance_interval; // tokens between hot-cache rebalances
+
     enum llama_pooling_type pooling_type;
 
     ggml_backend_sched_eval_callback cb_eval;
