@@ -1,5 +1,6 @@
 import { config } from '$lib/stores/settings.svelte';
 import { REDACTED_HEADERS } from '$lib/constants';
+import { STREAM_FEATURE_TOKENS } from '$lib/constants/agentic';
 import { redactValue } from './redact';
 
 /**
@@ -64,4 +65,16 @@ export function sanitizeHeaders(
 	}
 
 	return sanitized;
+}
+
+/**
+ * Get headers for streaming chat completion requests.
+ * Includes X-Stream-Features to opt into typed SSE events.
+ */
+export function getStreamHeaders(): Record<string, string> {
+	return {
+		'Content-Type': 'application/json',
+		'X-Stream-Features': STREAM_FEATURE_TOKENS.join(','),
+		...getAuthHeaders()
+	};
 }
