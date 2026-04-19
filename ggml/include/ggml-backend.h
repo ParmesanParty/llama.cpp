@@ -328,6 +328,13 @@ extern "C" {
     GGML_API int                  ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched);
     GGML_API int                  ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched);
 
+    // Expert frequency tracking (MoE telemetry)
+    // Returns pointer to internal frequency array, or NULL if no data.
+    // Layout: flat array of n_layers * max_experts_stride floats (stride returned via parameter).
+    // Caller must not free. Values are EMA frequencies in [0, 1].
+    GGML_API const float * ggml_backend_sched_get_expert_freq(ggml_backend_sched_t sched, int * n_layers, int * n_experts, uint64_t * n_tokens, int * stride, float * decay);
+    GGML_API void          ggml_backend_sched_reset_expert_freq(ggml_backend_sched_t sched);
+
     GGML_API ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched_t sched, ggml_backend_t backend);
     GGML_API size_t                     ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend);
 
