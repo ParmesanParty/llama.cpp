@@ -105,6 +105,9 @@ class ConversationsStore {
 		}
 	}
 
+	/** Whether thinking is enabled for the active conversation */
+	activeThinkingEnabled = $state<boolean>(false);
+
 	/** Callback for title update confirmation dialog */
 	titleUpdateConfirmationCallback?: (currentTitle: string, newTitle: string) => Promise<boolean>;
 
@@ -241,7 +244,8 @@ class ConversationsStore {
 	 */
 	async createConversation(name?: string): Promise<string> {
 		const conversationName = name || `Chat ${new Date().toLocaleString()}`;
-		const conversation = await DatabaseService.createConversation(conversationName);
+		const enableThinking = this.activeThinkingEnabled;
+		const conversation = await DatabaseService.createConversation(conversationName, enableThinking);
 
 		if (this.pendingMcpServerOverrides.length > 0) {
 			// Deep clone to plain objects (Svelte 5 $state uses Proxies which can't be cloned to IndexedDB)
@@ -280,6 +284,7 @@ class ConversationsStore {
 
 			this.pendingMcpServerOverrides = [];
 			this.activeConversation = conversation;
+			this.activeThinkingEnabled = conversation.enableThinking ?? !!config().enableThinking;
 
 			if (conversation.currNode) {
 				const allMessages = await DatabaseService.getConversationMessages(convId);
@@ -309,6 +314,7 @@ class ConversationsStore {
 		this.activeMessages = [];
 		// reload MCP defaults so new chats inherit persisted state
 		this.pendingMcpServerOverrides = ConversationsStore.loadMcpDefaults();
+		this.activeThinkingEnabled = !!config().enableThinking;
 	}
 
 	/**
@@ -420,6 +426,26 @@ class ConversationsStore {
 	 */
 	async getConversationMessages(convId: string): Promise<DatabaseMessage[]> {
 		return await DatabaseService.getConversationMessages(convId);
+	}
+
+	/**
+	 * Toggles thinking mode for the active conversation
+	 */
+	async toggleThinking(): Promise<void> {
+		await this.updateThinking(!this.activeThinkingEnabled);
+	}
+
+	/**
+	 * Updates thinking mode for the active conversation
+	 * @param enabled - Whether thinking should be enabled
+	 */
+	async updateThinking(enabled: boolean): Promise<void> {
+		this.activeThinkingEnabled = enabled;
+		if (this.activeConversation) {
+			await DatabaseService.updateConversation(this.activeConversation.id, {
+				enableThinking: enabled
+			});
+		}
 	}
 
 	/**
@@ -964,3 +990,4 @@ export function buildConversationTree(convs: DatabaseConversation[]): Conversati
 
 	return result;
 }
+export const activeThinkingEnabled = () => conversationsStore.activeThinkingEnabled;

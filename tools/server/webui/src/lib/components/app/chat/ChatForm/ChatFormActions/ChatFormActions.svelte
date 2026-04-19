@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Square } from '@lucide/svelte';
+	import { Square, Brain } from '@lucide/svelte';
 	import { Button } from '$lib/components/ui/button';
 	import {
 		ChatFormActionAttachmentsDropdown,
@@ -19,7 +19,7 @@
 	import { modelsStore, modelOptions, selectedModelId } from '$lib/stores/models.svelte';
 	import { isRouterMode, serverError } from '$lib/stores/server.svelte';
 	import { chatStore } from '$lib/stores/chat.svelte';
-	import { activeMessages, conversationsStore } from '$lib/stores/conversations.svelte';
+	import { conversationsStore, activeMessages, activeThinkingEnabled } from '$lib/stores/conversations.svelte';
 	import { IsMobile } from '$lib/hooks/is-mobile.svelte';
 
 	interface Props {
@@ -222,6 +222,16 @@
 			{disabled}
 			onSettingsClick={() => chatSettingsDialog.open(SETTINGS_SECTION_TITLES.MCP)}
 		/>
+		<Button
+			variant="ghost"
+			size="icon"
+			onclick={() => conversationsStore.toggleThinking()}
+			class="h-8 w-8 rounded-full p-0"
+			{disabled}
+			title={activeThinkingEnabled() ? 'Thinking enabled' : 'Thinking disabled'}
+		>
+			<Brain class="h-4 w-4 {activeThinkingEnabled() ? 'text-primary' : 'text-muted-foreground'}" />
+		</Button>
 	</div>
 
 	<div class="ml-auto flex items-center gap-1.5">
