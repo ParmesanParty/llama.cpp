@@ -33,6 +33,7 @@ add_library(llama
             llama-model-saver.cpp
             llama-model.cpp
             llama-moe-hot-cache.cpp
+            llama-moe-fused-cold.cpp
             llama-quant.cpp
             llama-sampler.cpp
             llama-vocab.cpp
@@ -53,6 +54,15 @@ target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 target_link_libraries(llama PUBLIC ggml)
+
+# The fused cold MoE kernel needs OpenMP barriers for intra-node
+# thread synchronization (matches ggml-cpu's own barrier mechanism).
+if (GGML_OPENMP)
+    find_package(OpenMP)
+    if (OpenMP_CXX_FOUND)
+        target_link_libraries(llama PRIVATE OpenMP::OpenMP_CXX)
+    endif()
+endif()
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
