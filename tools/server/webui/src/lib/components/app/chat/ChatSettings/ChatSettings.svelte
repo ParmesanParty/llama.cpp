@@ -94,6 +94,11 @@
 					key: SETTINGS_KEYS.TITLE_GENERATION_USE_FIRST_LINE,
 					label: 'Use first non-empty line for conversation title',
 					type: SettingsFieldType.CHECKBOX
+				},
+				{
+					key: SETTINGS_KEYS.ENABLE_THINKING,
+					label: 'Enable extended thinking for new conversations',
+					type: SettingsFieldType.CHECKBOX
 				}
 			]
 		},

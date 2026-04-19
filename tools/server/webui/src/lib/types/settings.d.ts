@@ -27,6 +27,8 @@ export interface SettingsChatServiceOptions {
 	// Strip reasoning content from context before sending
 	excludeReasoningFromContext?: boolean;
 	tools?: OpenAIToolDefinition[];
+	// Enable extended thinking
+	enableThinking?: boolean;
 	// Generation parameters
 	temperature?: number;
 	max_tokens?: number;
