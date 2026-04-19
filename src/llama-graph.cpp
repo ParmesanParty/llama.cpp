@@ -1,9 +1,12 @@
 #include "llama-graph.h"
 
+#include "ggml-cpu.h"
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
+#include "llama-moe-hot-cache.h"
+#include "llama-moe-fused-cold.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -13,10 +16,37 @@
 
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <sstream>
 #include <unordered_set>
+
+// MoE hot cache PP bypass: when n_tokens > this threshold, build_moe_ffn
+// skips the dual-path and emits the original single-path MUL_MAT_IDs (the
+// same code path as if the cache were disabled). Decode-sized ubatches
+// (n_tokens ≤ threshold) keep the dual-path so the K hot experts on GPU
+// continue to accelerate token generation.
+//
+// Default 0 means "no bypass" (i.e., current K=32 behavior — dual-path
+// at every ubatch size). A typical production value is 64 — large enough
+// to cover N_PARALLEL=2 batched decode plus speculative decoding bursts,
+// small enough to bypass any prefill ubatch (typically 512–4096 tokens).
+//
+// Read once via static; getenv per layer would be wasteful at PP cadence.
+static int moe_hot_pp_bypass_threshold() {
+    static bool init = false;
+    static int  threshold = 0;
+    if (!init) {
+        const char * env = getenv("LLAMA_MOE_HOT_PP_BYPASS_N_TOKENS");
+        if (env && *env) {
+            const int v = atoi(env);
+            if (v > 0) threshold = v;
+        }
+        init = true;
+    }
+    return threshold;
+}
 
 // dedup helpers
 
@@ -951,6 +981,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     mctx             (params.mctx),
     cross            (params.cross),
+    moe_hot_cache    (params.moe_hot_cache),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -1325,7 +1356,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * gate_up_exps,
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
-         ggml_tensor * down_exps_s) const {
+         ggml_tensor * down_exps_s,
+const llama_moe_hot_cache * hot_cache) const {
     return build_moe_ffn(
         cur,
         gate_inp,  /* gate_inp_b  */ nullptr,
@@ -1345,7 +1377,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         /* gate_up_exps_b */ nullptr,
         up_exps_s,
         gate_exps_s,
-        down_exps_s
+        down_exps_s,
+        hot_cache
     );
 }
 
@@ -1372,7 +1405,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * gate_up_exps_b,
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
-         ggml_tensor * down_exps_s) const {
+         ggml_tensor * down_exps_s,
+const llama_moe_hot_cache * hot_cache) const {
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
@@ -1459,6 +1493,170 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     cb(selected_experts->src[0], "ffn_moe_argsort", il);
     cb(selected_experts, "ffn_moe_topk", il);
 
+    // MoE hot cache: mark the argsort result (parent of selected_experts)
+    // as a graph output so ggml_backend_sched's graph allocator does NOT
+    // recycle its memory after MUL_MAT_ID consumes it. The post-decode hook
+    // in llama-moe-hot-cache.cpp reads this tensor to harvest the routed
+    // expert IDs; without the flag the allocator's layout planner reuses
+    // the buffer for a later op's output and the post-decode read returns
+    // whatever garbage that later op wrote (see Phase 9 investigation
+    // session — the symptom is "ffn_moe_topk returns float bit patterns
+    // after decode"). We flag the PARENT (the ggml_argsort output), not
+    // the view `selected_experts`, because the flag needs to live on the
+    // tensor that owns the underlying storage. Flagging a view is a no-op
+    // for the allocator. Gate on hot_cache != nullptr so cache-disabled
+    // builds pay no allocator-pressure cost. Do NOT also flag the view —
+    // that would double-count in the output set.
+    if (hot_cache != nullptr && selected_experts->src[0] != nullptr) {
+        ggml_set_output(selected_experts->src[0]);
+    }
+
+    // Hot cache split preparation: if enabled, remap selected_experts into
+    // hot_ids (slot in [0,K) or -1) and cold_ids (original expert id or -1)
+    // by looking up the per-layer hot_map / cold_map tensors. Dense layers in
+    // hybrid architectures leave hot_map == nullptr, in which case the dual
+    // path is silently skipped and build_moe_ffn emits its vanilla single-
+    // path MUL_MAT_IDs unchanged.
+    //
+    // Shape wrangling: hot_map / cold_map are 1D [n_expert] I32 lookup
+    // tables. Two ggml API contracts constrain how we can use them:
+    //
+    //   (a) ggml_get_rows asserts a->ne[2] == b->ne[1] — the source's
+    //       "batch" dim must match the indexer's row-count dim. The
+    //       existing scale-lookup pattern (see up_exps_s below) inflates
+    //       a 1D F32 source via reshape_3d + repeat_4d to [1, n_expert,
+    //       n_tokens], then get_rows with a 2D [n_expert_used, n_tokens]
+    //       indexer. But...
+    //
+    //   (b) GGML_OP_REPEAT is unsupported on CUDA for I32/I16 sources
+    //       (see ggml/src/ggml-cuda/ggml-cuda.cu:4928-4932). Running
+    //       repeat_4d on an I32 hot_map silently falls through to an
+    //       unsupported-op path and manifests as "CUDA error: an illegal
+    //       memory access was encountered" during graph compute.
+    //
+    // The fix is to flatten selected_experts to 1D before the lookup and
+    // reshape the result back to 2D afterwards. With a 1D indexer the
+    // (a) assertion reduces to a->ne[2]==1 == b->ne[1]==1 and is
+    // trivially satisfied by a [1, n_expert] source — no repeat needed.
+    ggml_tensor * hot_ids  = nullptr;
+    ggml_tensor * cold_ids = nullptr;
+    // Dual-path emission (Phase 7 + Phase 10 correctness).
+    //
+    // Phase 7 wired the dual-path graph (hot MUL_MAT_ID on the compact VRAM
+    // buffer, cold MUL_MAT_ID on the original CPU-resident expert weights,
+    // summed via ggml_add) as dead code behind a Phase 9 defer guard because
+    // two independent correctness bugs surfaced on first activation:
+    //
+    //   (a) mm_ids_helper's ids_src1/ids_dst tail was uninitialized in the
+    //       all-negative-ids case. The downstream quantize and MMQ kernels
+    //       then iterated the full ne_get_rows, reading garbage. Fixed by
+    //       the Phase 1 retrofit in ggml-cuda/mmq.cu that sync-reads
+    //       expert_bounds[n_experts] and caps iteration at the compact
+    //       valid total. (Landed in Phase 9.)
+    //
+    //   (b) promote_layer updated hot_map on device but never updated
+    //       cold_map (which init set to identity). The dual-path then
+    //       double-counted: for every hot expert, both hot_ids and
+    //       cold_ids were non-negative at the same token/slot, and
+    //       ggml_add(hot_mm, cold_mm) produced 2x the correct activation.
+    //       Symptom: coherent-looking gibberish output. Fixed by pushing a
+    //       freshly derived cold_map alongside hot_map on every promote,
+    //       via llama_moe_hot_cache_build_cold_map. Phase 10 also patches
+    //       the scheduler's sched_compute_splits ids scanner
+    //       (ggml-backend.cpp used_ids loop) to skip negative ids, matching
+    //       the Phase 1 kernel sentinel-skip semantics at the scheduler
+    //       level.
+    //
+    // With (a) and (b) both resolved the dual-path runs cleanly. The gate
+    // flipped open in Phase 10; see the progress log's Phase 10 section
+    // for the debug timeline and Decision #34.
+    // PP bypass (LLAMA_MOE_HOT_PP_BYPASS_N_TOKENS): at large n_tokens
+    // (prefill), skip the dual-path entirely. The downstream gate_up_exps
+    // and separate-gate/up branches both check `hot_ids != nullptr` (and
+    // for the fully-separate path, all of hot_up/hot_gate/hot_down) before
+    // emitting dual-path MMIDs — leaving hot_ids/cold_ids as nullptr here
+    // makes them fall through to the original single-path MUL_MAT_ID, the
+    // same code that runs when LLAMA_ARG_MOE_HOT_K=0.
+    //
+    // Why this is safe to skip selectively: the hot cache buffers and
+    // routing-frequency tracker remain populated across PP ubatches (the
+    // post-decode hook at llama-context.cpp still runs and updates them
+    // from the standard `selected_experts->src[0]` argsort output). When
+    // the next decode ubatch arrives at n_tokens ≤ threshold, dual-path
+    // engages with the warm hot cache exactly as before.
+    const int   pp_bypass_threshold = moe_hot_pp_bypass_threshold();
+    const bool  pp_bypass_active    =
+        pp_bypass_threshold > 0 && n_tokens > pp_bypass_threshold;
+
+    if (hot_cache != nullptr && llama_moe_hot_cache_layer_has_hot(hot_cache, il) &&
+        !pp_bypass_active) {
+        ggml_tensor * hot_map  = llama_moe_hot_cache_get_hot_map(hot_cache, il);
+        ggml_tensor * cold_map = llama_moe_hot_cache_get_cold_map(hot_cache, il);
+        if (hot_map != nullptr && cold_map != nullptr) {
+            // Reshape the 1D [n_expert] lookup tables to 2D [1, n_expert] so
+            // ggml_get_rows sees them as "n_expert rows of width 1" rather
+            // than "1 row of width n_expert".
+            ggml_tensor * hot_map_2d  = ggml_reshape_2d(ctx0, hot_map,  1, n_expert);
+            ggml_tensor * cold_map_2d = ggml_reshape_2d(ctx0, cold_map, 1, n_expert);
+
+            // selected_experts is a ggml_view_4d of the argsort result with
+            // inherited (non-contiguous) strides — see ggml_argsort_top_k
+            // at ggml.c:5248. ggml_reshape_1d asserts contiguity, so we
+            // materialize a compact copy via ggml_cont before flattening.
+            // The copy is an I32 [n_expert_used, n_tokens] tensor
+            // (tens of KB even at 2k-token batches), cheap compared to
+            // the actual MoE FFN ops.
+            ggml_tensor * sel_cont = ggml_cont(ctx0, selected_experts);
+            ggml_tensor * sel_flat = ggml_reshape_1d(
+                ctx0, sel_cont, n_expert_used * n_tokens);
+
+            hot_ids  = ggml_get_rows(ctx0, hot_map_2d,  sel_flat); // [1, K*T, 1, 1]
+            cold_ids = ggml_get_rows(ctx0, cold_map_2d, sel_flat);
+            // Collapse back to 2D [n_expert_used, n_tokens] for use as
+            // MUL_MAT_ID's ids argument.
+            hot_ids  = ggml_reshape_2d(ctx0, hot_ids,  n_expert_used, n_tokens);
+            cold_ids = ggml_reshape_2d(ctx0, cold_ids, n_expert_used, n_tokens);
+            cb(hot_ids,  "ffn_moe_hot_ids",  il);
+            cb(cold_ids, "ffn_moe_cold_ids", il);
+
+            // Parmesan (corruption fix, 2026-04-13): anchor hot_ids/cold_ids
+            // into the topology BEFORE any hot-path ops are built.
+            //
+            // Why: the fully-separate dual-path below emits
+            //   ggml_build_forward_expand(gf, experts_hot)  // hot path DFS'd
+            //   experts_cold = ... cold_ids ...
+            //   ggml_build_forward_expand(gf, experts_cold) // cold path DFS'd
+            //
+            // Without this anchor, DFS post-order places cold_ids's subgraph
+            // (get_rows + reshape of cold_map_2d) AFTER every hot-path op in
+            // topology, which the scheduler then folds into the HOT (barrier)
+            // split because cold_ids is CUDA-backed and same-backend as hot.
+            //
+            // Consequence: the cross-backend async copy prefetch at the start
+            // of the hot split records its event BEFORE the barrier split's
+            // compute_async runs, so the event does NOT capture get_rows_cold's
+            // write to cold_ids's device memory. The subsequent D2H on
+            // copy_stream then races the compute_stream's write, feeding the
+            // CPU fused-cold kernel either stale or partially-written cold_ids
+            // — silent MoE routing corruption manifesting as token stutter,
+            // mid-word chopping, and phantom prior-turn hallucinations.
+            //
+            // Anchoring hot_ids/cold_ids here places their producer nodes
+            // before the hot half's gate MMID in topology order, so they land
+            // in the pre-barrier CUDA split. The prefetch's event then
+            // correctly captures their completion, the D2H races nothing, and
+            // the cold kernel reads valid ids. Empirical evidence: the
+            // scheduler-level PREFETCH_INPUT trace showed producer_split ==
+            // barrier_split (in_barrier=1) for cold_ids on 294/294 layer
+            // samples before this fix.
+            //
+            // See docs/superpowers/plans/2026-04-13-moe-concurrent-decode-
+            // corruption-handoff-2.md for the full investigation.
+            ggml_build_forward_expand(gf, hot_ids);
+            ggml_build_forward_expand(gf, cold_ids);
+        }
+    }
+
     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
         // TODO: Use scalar div instead when/if implemented
         ggml_tensor * f_sel = ggml_cast(ctx0, selected_experts, GGML_TYPE_F32);
@@ -1516,7 +1714,60 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
-        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts); // [n_ff*2, n_expert_used, n_tokens]
+        ggml_tensor * gate_up;
+        ggml_tensor * hot_gate_up = hot_cache != nullptr
+            ? llama_moe_hot_cache_get_hot_gate_up(hot_cache, il)
+            : nullptr;
+        if (hot_gate_up != nullptr && hot_ids != nullptr) {
+            // Dual-path: hot experts on compact VRAM buffer, cold experts on
+            // original tensor. Both nodes contain -1 sentinel ids (hot node
+            // masks cold experts, cold node masks hot experts).
+            //
+            // Sentinel-skip semantics across backends (flag controls what):
+            //   - CPU (ggml-cpu.c:1610-1613): flag gates BOTH the dst
+            //     zero-init memset AND the per-slot negative-id skip inside
+            //     the compact loop. Without the flag, the CPU kernel would
+            //     read matrix_rows[-1] on sentinel slots — heap corruption.
+            //   - CUDA top-of-function (ggml-cuda.cu:2411-2414): flag gates
+            //     ONLY the cudaMemsetAsync dst zero-init. This is the only
+            //     flag-gated CUDA behavior in the MUL_MAT_ID path.
+            //   - CUDA mm_ids_helper / mul_mat_vec_q kernels: the sentinel-
+            //     skip branch is UNCONDITIONAL (not flag-gated). Non-sentinel
+            //     callers never produce negative ids, so the branch is dead
+            //     for them and has zero measurable overhead.
+            //
+            // So the flag's net effect is: "zero the dst region so that
+            // downstream ops reading from it see zero in positions whose ids
+            // were skipped, rather than uninitialized pool memory."
+            //
+            // Downstream zero-init invariant (load-bearing for Phase 9+):
+            // the `ggml_add(gate_up_hot, gate_up_cold)` below and the
+            // subsequent `ggml_mul(gate_up, up_exps_s_expanded)` scale apply
+            // both run AFTER the flag-gated cudaMemsetAsync on the compute
+            // stream. This ordering makes "sentinel-skipped slot == zero"
+            // well-defined, which is the invariant that lets us apply the
+            // per-expert scales (indexed by the ORIGINAL selected_experts
+            // ids, not hot_ids/cold_ids) to the merged sum rather than to
+            // each branch separately. See llama-moe-hot-cache.h lines 53-58.
+            // If a future phase ever clears GGML_MUL_MAT_ID_FLAG_SENTINEL on
+            // a dual-path MUL_MAT_ID node, the scale multiply will fold
+            // uninitialized data into the sum — subtle numeric drift, very
+            // hard to diagnose. Keep the flag.
+            //
+            // LoRA refusal at init time (Task 5.1) guarantees build_lora_mm_id
+            // returns the raw MUL_MAT_ID node here, so op_params[0] hits the
+            // correct slot. A future LoRA-compatible path would need to
+            // bypass the wrapper or reach past the LoRA ggml_add_id.
+            ggml_tensor * gate_up_hot  = build_lora_mm_id(hot_gate_up,  cur, hot_ids);
+            ggml_tensor * gate_up_cold = build_lora_mm_id(gate_up_exps, cur, cold_ids);
+            gate_up_hot ->op_params[0] = GGML_MUL_MAT_ID_FLAG_SENTINEL;
+            gate_up_cold->op_params[0] = GGML_MUL_MAT_ID_FLAG_SENTINEL;
+            cb(gate_up_hot,  "ffn_moe_gate_up_hot",  il);
+            cb(gate_up_cold, "ffn_moe_gate_up_cold", il);
+            gate_up = ggml_add(ctx0, gate_up_hot, gate_up_cold);
+        } else {
+            gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts); // [n_ff*2, n_expert_used, n_tokens]
+        }
         cb(gate_up, "ffn_moe_gate_up", il);
 
         if (gate_up_exps_b) {
@@ -1539,117 +1790,447 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         up  = ggml_view_3d(ctx0, gate_up, n_ff, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], n_ff * gate_up->nb[0]);
         cb(up, "ffn_moe_up", il);
     } else {
-        // separate gate and up path
-        up = build_lora_mm_id(up_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
-        cb(up, "ffn_moe_up", il);
+        // separate gate and up path.
+        //
+        // Phase 11 structural optimization — FULLY SEPARATE DUAL-PATH:
+        //
+        // When the hot cache dual-path is active AND the model has no MoE
+        // expert biases AND the activation is SiLU/SwiGLU, compute the hot
+        // and cold halves INDEPENDENTLY through the entire FFN pipeline
+        // (up/gate MMIDs → scale → swiglu → down MMID) and add only at the
+        // very end. This is mathematically equivalent to the merged-then-
+        // split approach because of the sentinel-slot invariant:
+        //
+        //   at every slot, exactly one of (hot, cold) is non-zero, and the
+        //   other side's MMID output is zero (sentinel-skip semantics).
+        //
+        // Therefore:
+        //   silu(gate_hot + gate_cold) * (up_hot + up_cold)
+        //   == silu(gate_hot) * up_hot  +  silu(gate_cold) * up_cold
+        //
+        // The cross-terms vanish because silu(0) == 0 and 0 * anything == 0.
+        //
+        // Why this matters for performance: the cold path stays entirely on
+        // CPU from up_cold through down_cold. Without this split the cold
+        // path had to hand off to CUDA for the ggml_add + swiglu, then
+        // hand back to CPU for down_cold — 2 CPU splits per layer. With
+        // this split, the cold path is ONE contiguous CPU split covering
+        // up_cold, gate_cold, swiglu, down_cold. That eliminates ~48
+        // cross-backend drain events per decode (one per layer), saving
+        // ~500 μs per drain × 48 ≈ 24 ms per decode at baseline cadence.
+        //
+        // The hot path is similarly contiguous on CUDA from up_hot through
+        // down_hot. Only the final ggml_add(experts_hot, experts_cold)
+        // forces a final CUDA↔CPU transition — exactly one per layer.
+        //
+        // Constraints (the full set of conditions that must hold; if any
+        // are false, fall through to the merged dual-path below):
+        //   - dual-path is active on this layer (hot tensors present)
+        //   - no expert biases (silu is nonlinear, so biases would break
+        //     the sentinel-slot distributivity invariant)
+        //   - type_op == LLM_FFN_SILU (we only implement swiglu_split here;
+        //     other activations can be added with the same pattern)
+        //   - !weight_before_ffn (llama4's early-weight path is unrelated
+        //     to the dual-path optimization and is rare)
+        //   - arch != STEP35 (it has a per-layer swiglu clamp hack that
+        //     would need per-half application — future work)
+        //   - arch != GROVEMOE (it rescales selected_experts, which would
+        //     need a corresponding adjustment to hot_ids/cold_ids)
+        //
+        // The fallback (merged dual-path or single-path) is unchanged and
+        // handles every case that this branch excludes.
+        ggml_tensor * hot_up = hot_cache != nullptr
+            ? llama_moe_hot_cache_get_hot_up(hot_cache, il)
+            : nullptr;
+        ggml_tensor * hot_gate = hot_cache != nullptr
+            ? llama_moe_hot_cache_get_hot_gate(hot_cache, il)
+            : nullptr;
+        ggml_tensor * hot_down = hot_cache != nullptr
+            ? llama_moe_hot_cache_get_hot_down(hot_cache, il)
+            : nullptr;
+        const bool dual_up_gate_down =
+            hot_up   != nullptr && hot_gate != nullptr && hot_down != nullptr &&
+            hot_ids  != nullptr && cold_ids != nullptr &&
+            gate_exps != nullptr;
+        const bool fully_separate_eligible =
+            dual_up_gate_down &&
+            !weight_before_ffn &&
+            type_op == LLM_FFN_SILU &&
+            up_exps_b   == nullptr &&
+            gate_exps_b == nullptr &&
+            down_exps_b == nullptr &&
+            arch != LLM_ARCH_STEP35 &&
+            arch != LLM_ARCH_GROVEMOE;
 
-        if (up_exps_b) {
-            up = ggml_add_id(ctx0, up, up_exps_b, selected_experts);
-            cb(up, "ffn_moe_up_biased", il);
+        // [MOE-DIAG] Log per-layer the inputs to fully_separate_eligible so
+        // we can count exactly how many layers take the dual-path fused-cold
+        // emission vs fall through to merged-dual or single-path. Gated on
+        // LLAMA_MOE_DIAG to stay quiet in prod.
+        if (getenv("LLAMA_MOE_DIAG") != nullptr) {
+            fprintf(stderr,
+                "WARN [moe-diag] build_moe_ffn il=%d n_tokens=%d eligible=%d "
+                "has_hot=%d hot_up=%d hot_gate=%d hot_down=%d "
+                "hot_ids=%d cold_ids=%d gate_exps=%d "
+                "pp_bypass=%d !wbf=%d silu=%d no_bias=%d\n",
+                il, (int)n_tokens, (int)fully_separate_eligible,
+                (int)(hot_cache != nullptr &&
+                      llama_moe_hot_cache_layer_has_hot(hot_cache, il)),
+                (int)(hot_up != nullptr),
+                (int)(hot_gate != nullptr),
+                (int)(hot_down != nullptr),
+                (int)(hot_ids != nullptr),
+                (int)(cold_ids != nullptr),
+                (int)(gate_exps != nullptr),
+                (int)pp_bypass_active,
+                (int)!weight_before_ffn,
+                (int)(type_op == LLM_FFN_SILU),
+                (int)(up_exps_b == nullptr &&
+                      gate_exps_b == nullptr &&
+                      down_exps_b == nullptr));
+            fflush(stderr);
         }
 
-        // apply per-expert scale2 to up
-        if (up_exps_s) {
-            ggml_tensor * s = ggml_reshape_3d(ctx0, up_exps_s, 1, n_expert, 1);
-            s = ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1);
-            s = ggml_get_rows(ctx0, s, selected_experts); // [1, n_expert_used, n_tokens]
-            up = ggml_mul(ctx0, up, s);
-            cb(up, "ffn_moe_up_scaled", il);
-        }
+        if (fully_separate_eligible) {
+            // Helper: compute one half (hot OR cold) through
+            // up MMID → up_s → gate MMID → gate_s → swiglu → down MMID.
+            // Returns the un-weighted, un-aggregated [n_embd, n_expert_used,
+            // n_tokens] experts tensor for this half.
+            //
+            // NOTE: down_s is NOT applied inside this helper. The downstream
+            // code after this branch re-applies down_b / down_s to the
+            // merged `experts` tensor, which is equivalent because per-slot
+            // multiplication distributes over ggml_add.
+            // Helper: compute one half (hot OR cold) through
+            // up MMID → up_s → gate MMID → gate_s → swiglu → down MMID.
+            // Returns the un-weighted, un-aggregated [n_embd, n_expert_used,
+            // n_tokens] experts tensor for this half.
+            //
+            // NOTE: down_s is NOT applied inside this helper. The downstream
+            // code after this branch re-applies down_b / down_s to the
+            // merged `experts` tensor, which is equivalent because per-slot
+            // multiplication distributes over ggml_add.
+            auto build_half = [&](ggml_tensor * up_w,
+                                  ggml_tensor * gate_w,
+                                  ggml_tensor * down_w,
+                                  ggml_tensor * ids_arg,
+                                  const char * up_tag,
+                                  const char * up_s_tag,
+                                  const char * gate_tag,
+                                  const char * gate_s_tag,
+                                  const char * swiglu_tag,
+                                  const char * down_tag,
+                                  bool split_barrier = false) -> ggml_tensor * {
+                ggml_tensor * u = build_lora_mm_id(up_w, cur, ids_arg);
+                u->op_params[0] = GGML_MUL_MAT_ID_FLAG_SENTINEL;
+                cb(u, up_tag, il);
+                if (up_exps_s) {
+                    ggml_tensor * s = ggml_reshape_3d(ctx0, up_exps_s, 1, n_expert, 1);
+                    s = ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1);
+                    s = ggml_get_rows(ctx0, s, selected_experts);
+                    u = ggml_mul(ctx0, u, s);
+                    cb(u, up_s_tag, il);
+                }
+                ggml_tensor * g = build_lora_mm_id(gate_w, cur, ids_arg);
+                g->op_params[0] = GGML_MUL_MAT_ID_FLAG_SENTINEL;
+                // The gate MUL_MAT_ID is the first hot-path node in graph
+                // order (ggml_swiglu_split(g, u) visits src[0]=g before
+                // src[1]=u during DFS). The barrier must be here for the
+                // scheduler to split [attention] from [hot] correctly.
+                if (split_barrier) {
+                    g->flags |= GGML_TENSOR_FLAG_SPLIT_BARRIER;
+                }
+                cb(g, gate_tag, il);
+                if (gate_exps_s) {
+                    ggml_tensor * s = ggml_reshape_3d(ctx0, gate_exps_s, 1, n_expert, 1);
+                    s = ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1);
+                    s = ggml_get_rows(ctx0, s, selected_experts);
+                    g = ggml_mul(ctx0, g, s);
+                    cb(g, gate_s_tag, il);
+                }
+                // swiglu on this half: silu(g) * u. At sentinel slots both
+                // g and u are zero, so silu(0)*0 = 0 — contributes nothing.
+                ggml_tensor * act = ggml_swiglu_split(ctx0, g, u);
+                cb(act, swiglu_tag, il);
+                ggml_tensor * d = build_lora_mm_id(down_w, act, ids_arg);
+                d->op_params[0] = GGML_MUL_MAT_ID_FLAG_SENTINEL;
+                cb(d, down_tag, il);
+                return d;
+            };
 
-        if (gate_exps) {
-            cur = build_lora_mm_id(gate_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
-            cb(cur, "ffn_moe_gate", il);
+            // Emit HOT half first and expand to anchor graph order. The
+            // explicit forward_expand keeps the scheduler's topo walk from
+            // interleaving hot and cold splits — it sees hot nodes as
+            // already-visited when cold nodes' subtrees depend on the same
+            // `cur` input.
+            ggml_tensor * experts_hot = build_half(
+                hot_up, hot_gate, hot_down, hot_ids,
+                "ffn_moe_up_hot", "ffn_moe_up_scaled_hot",
+                "ffn_moe_gate_hot", "ffn_moe_gate_scaled_hot",
+                "ffn_moe_swiglu_hot", "ffn_moe_down_hot",
+                true /* split_barrier: force scheduler to separate
+                        [attention] and [hot] into distinct CUDA splits
+                        so the prefetch loop can issue the cold-input
+                        D2H between them */);
+            ggml_build_forward_expand(gf, experts_hot);
+
+            // Fused cold kernel eligibility.
+            //
+            // Kernel body invariants:
+            //   (1) up and gate share a type. Phase 1 uses a single
+            //       `traits` (derived from up's type) for both `up` and
+            //       `gate` vec_dots.
+            //   (2) down's vec_dot consumes an `act_q` buffer that was
+            //       quantized once using up's vec_dot_type. For a
+            //       heterogeneous down type to work, its vec_dot_type must
+            //       match up's. In practice every Q*_K family member uses
+            //       GGML_TYPE_Q8_K as vec_dot_type, so Q4_K / Q5_K / Q6_K
+            //       mix freely (as they do under unsloth's Q4_K_L dynamic
+            //       quant, which promotes down_exps to Q6_K on ~half the
+            //       MoE layers). An exact up==down type match was
+            //       over-restrictive and pushed those layers onto the
+            //       generic MUL_MAT_ID path for no kernel-safety reason.
+            const auto up_vdt   =
+                ggml_get_type_traits_cpu(up_exps->type)  ->vec_dot_type;
+            const auto down_vdt =
+                ggml_get_type_traits_cpu(down_exps->type)->vec_dot_type;
+            const bool fused_cold_eligible =
+                (up_exps_s == nullptr) &&
+                (gate_exps_s == nullptr) &&
+                (up_exps->type == gate_exps->type) &&
+                (up_vdt == down_vdt) &&
+                (hot_cache != nullptr);
+
+            ggml_tensor * experts_cold;
+            if (fused_cold_eligible) {
+                ggml_tensor * args[] = {
+                    up_exps, gate_exps, down_exps, cur, cold_ids
+                };
+                experts_cold = ggml_custom_4d(
+                    ctx0,
+                    GGML_TYPE_F32,
+                    cur->ne[0],           // n_embd
+                    cold_ids->ne[0],      // n_expert_used
+                    cold_ids->ne[1],      // n_tokens
+                    1,
+                    args, 5,
+                    llama_moe_fused_cold_compute,
+                    GGML_N_TASKS_MAX,
+                    const_cast<void *>(static_cast<const void *>(
+                        &hot_cache->fused_cold_params)));
+                cb(experts_cold, "ffn_moe_cold_fused", il);
+            } else {
+                experts_cold = build_half(
+                    up_exps, gate_exps, down_exps, cold_ids,
+                    "ffn_moe_up_cold", "ffn_moe_up_scaled_cold",
+                    "ffn_moe_gate_cold", "ffn_moe_gate_scaled_cold",
+                    "ffn_moe_swiglu_cold", "ffn_moe_down_cold");
+            }
+            ggml_build_forward_expand(gf, experts_cold);
+
+            // Merge. This is the ONLY cross-backend sync point per layer
+            // (CPU cold side's output copied into the CUDA stream for the
+            // final add). Everything else — the entire hot path on CUDA,
+            // the entire cold path on CPU — runs in contiguous same-
+            // backend splits.
+            experts = ggml_add(ctx0, experts_hot, experts_cold);
+            cb(experts, "ffn_moe_down", il);
+            // Leave up / cur nullptr. The downstream swiglu and down
+            // blocks are guarded on `experts == nullptr` and will no-op.
         } else {
-            cur = up;
-        }
+            // Fallback: MERGED dual-path (current Phase 10 / Phase 11
+            // reorder path). Used when fully_separate_eligible is false.
+            // Emits all hot MMIDs, then all cold MMIDs, then adds, so the
+            // scheduler batches same-backend ops into fewer splits.
+            const bool dual_up_gate =
+                hot_up   != nullptr && hot_gate != nullptr &&
+                hot_ids  != nullptr && gate_exps != nullptr;
 
-        if (gate_exps_b) {
-            cur = ggml_add_id(ctx0, cur, gate_exps_b, selected_experts);
-            cb(cur, "ffn_moe_gate_biased", il);
-        }
+            if (dual_up_gate) {
+                ggml_tensor * up_hot   = build_lora_mm_id(hot_up,    cur, hot_ids);
+                ggml_tensor * gate_hot = build_lora_mm_id(hot_gate,  cur, hot_ids);
+                up_hot  ->op_params[0] = GGML_MUL_MAT_ID_FLAG_SENTINEL;
+                gate_hot->op_params[0] = GGML_MUL_MAT_ID_FLAG_SENTINEL;
+                cb(up_hot,   "ffn_moe_up_hot",   il);
+                cb(gate_hot, "ffn_moe_gate_hot", il);
+                ggml_build_forward_expand(gf, up_hot);
+                ggml_build_forward_expand(gf, gate_hot);
 
-        // apply per-expert scale2 to gate
-        if (gate_exps_s) {
-            ggml_tensor * s = ggml_reshape_3d(ctx0, gate_exps_s, 1, n_expert, 1);
-            s = ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1);
-            s = ggml_get_rows(ctx0, s, selected_experts); // [1, n_expert_used, n_tokens]
-            cur = ggml_mul(ctx0, cur, s);
-            cb(cur, "ffn_moe_gate_scaled", il);
+                ggml_tensor * up_cold   = build_lora_mm_id(up_exps,   cur, cold_ids);
+                ggml_tensor * gate_cold = build_lora_mm_id(gate_exps, cur, cold_ids);
+                up_cold  ->op_params[0] = GGML_MUL_MAT_ID_FLAG_SENTINEL;
+                gate_cold->op_params[0] = GGML_MUL_MAT_ID_FLAG_SENTINEL;
+                cb(up_cold,   "ffn_moe_up_cold",   il);
+                cb(gate_cold, "ffn_moe_gate_cold", il);
+                ggml_build_forward_expand(gf, up_cold);
+                ggml_build_forward_expand(gf, gate_cold);
+
+                up  = ggml_add(ctx0, up_hot,   up_cold);
+                cur = ggml_add(ctx0, gate_hot, gate_cold);
+                cb(up,  "ffn_moe_up",   il);
+                cb(cur, "ffn_moe_gate", il);
+                ggml_build_forward_expand(gf, up);
+                ggml_build_forward_expand(gf, cur);
+            } else if (hot_up != nullptr && hot_ids != nullptr) {
+                ggml_tensor * up_hot  = build_lora_mm_id(hot_up,  cur, hot_ids);
+                ggml_tensor * up_cold = build_lora_mm_id(up_exps, cur, cold_ids);
+                up_hot ->op_params[0] = GGML_MUL_MAT_ID_FLAG_SENTINEL;
+                up_cold->op_params[0] = GGML_MUL_MAT_ID_FLAG_SENTINEL;
+                cb(up_hot,  "ffn_moe_up_hot",  il);
+                cb(up_cold, "ffn_moe_up_cold", il);
+                up = ggml_add(ctx0, up_hot, up_cold);
+                cb(up, "ffn_moe_up", il);
+                if (gate_exps) {
+                    if (hot_gate != nullptr) {
+                        ggml_tensor * gate_hot_n  = build_lora_mm_id(hot_gate,  cur, hot_ids);
+                        ggml_tensor * gate_cold_n = build_lora_mm_id(gate_exps, cur, cold_ids);
+                        gate_hot_n ->op_params[0] = GGML_MUL_MAT_ID_FLAG_SENTINEL;
+                        gate_cold_n->op_params[0] = GGML_MUL_MAT_ID_FLAG_SENTINEL;
+                        cb(gate_hot_n,  "ffn_moe_gate_hot",  il);
+                        cb(gate_cold_n, "ffn_moe_gate_cold", il);
+                        cur = ggml_add(ctx0, gate_hot_n, gate_cold_n);
+                    } else {
+                        cur = build_lora_mm_id(gate_exps, cur, selected_experts);
+                    }
+                    cb(cur, "ffn_moe_gate", il);
+                } else {
+                    cur = up;
+                }
+            } else {
+                // Pure single-path (cache disabled or hot layer not ready).
+                up = build_lora_mm_id(up_exps, cur, selected_experts);
+                cb(up, "ffn_moe_up", il);
+                if (gate_exps) {
+                    cur = build_lora_mm_id(gate_exps, cur, selected_experts);
+                    cb(cur, "ffn_moe_gate", il);
+                } else {
+                    cur = up;
+                }
+            }
+
+            // Bias + scale application for merged dual-path / single-path
+            // (only reached when fully_separate_eligible is false).
+            if (up_exps_b) {
+                up = ggml_add_id(ctx0, up, up_exps_b, selected_experts);
+                cb(up, "ffn_moe_up_biased", il);
+            }
+            if (up_exps_s) {
+                ggml_tensor * s = ggml_reshape_3d(ctx0, up_exps_s, 1, n_expert, 1);
+                s = ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1);
+                s = ggml_get_rows(ctx0, s, selected_experts);
+                up = ggml_mul(ctx0, up, s);
+                cb(up, "ffn_moe_up_scaled", il);
+            }
+            if (gate_exps_b) {
+                cur = ggml_add_id(ctx0, cur, gate_exps_b, selected_experts);
+                cb(cur, "ffn_moe_gate_biased", il);
+            }
+            if (gate_exps_s) {
+                ggml_tensor * s = ggml_reshape_3d(ctx0, gate_exps_s, 1, n_expert, 1);
+                s = ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1);
+                s = ggml_get_rows(ctx0, s, selected_experts);
+                cur = ggml_mul(ctx0, cur, s);
+                cb(cur, "ffn_moe_gate_scaled", il);
+            }
         }
     }
 
     const bool has_gate = gate_exps || gate_up_exps;
 
-    switch (type_op) {
-        case LLM_FFN_SILU:
-            if (gate_exps) {
-                // Step35: per-layer clamp for routed experts
-                if (arch == LLM_ARCH_STEP35 && il >= 0) {
-                    const float limit = hparams.swiglu_clamp_exp[il];
-                    constexpr float eps = 1e-6f;
-                    if (limit > eps) {
-                        ggml_tensor * gate_act = ggml_silu(ctx0, cur);
-                        cb(gate_act, "ffn_moe_silu", il);
-                        gate_act = ggml_clamp(ctx0, gate_act, -INFINITY, limit);
-                        cb(gate_act, "ffn_moe_silu_clamped", il);
+    // Fully-separate dual-path short-circuit: if the branch above already
+    // computed `experts` via per-half swiglu+down, skip the legacy swiglu
+    // switch and down MMID blocks below. Both sections modify `cur` /
+    // `experts`, so we need to guard them explicitly.
+    if (experts == nullptr) {
+        switch (type_op) {
+            case LLM_FFN_SILU:
+                if (gate_exps) {
+                    // Step35: per-layer clamp for routed experts
+                    if (arch == LLM_ARCH_STEP35 && il >= 0) {
+                        const float limit = hparams.swiglu_clamp_exp[il];
+                        constexpr float eps = 1e-6f;
+                        if (limit > eps) {
+                            ggml_tensor * gate_act = ggml_silu(ctx0, cur);
+                            cb(gate_act, "ffn_moe_silu", il);
+                            gate_act = ggml_clamp(ctx0, gate_act, -INFINITY, limit);
+                            cb(gate_act, "ffn_moe_silu_clamped", il);
 
-                        up = ggml_clamp(ctx0, up, -limit, limit);
-                        cb(up, "ffn_moe_up_clamped", il);
+                            up = ggml_clamp(ctx0, up, -limit, limit);
+                            cb(up, "ffn_moe_up_clamped", il);
 
-                        cur = ggml_mul(ctx0, gate_act, up);
-                        cb(cur, "ffn_moe_swiglu_limited", il);
-                        break;
+                            cur = ggml_mul(ctx0, gate_act, up);
+                            cb(cur, "ffn_moe_swiglu_limited", il);
+                            break;
+                        }
                     }
                 }
+
+                if (has_gate) {
+                    cur = ggml_swiglu_split(ctx0, cur, up);
+                    cb(cur, "ffn_moe_swiglu", il);
+                } else {
+                    cur = ggml_silu(ctx0, cur);
+                    cb(cur, "ffn_moe_silu", il);
+                } break;
+            case LLM_FFN_GELU:
+                if (has_gate) {
+                    cur = ggml_geglu_split(ctx0, cur, up);
+                    cb(cur, "ffn_moe_geglu", il);
+                } else {
+                    cur = ggml_gelu(ctx0, cur);
+                    cb(cur, "ffn_moe_gelu", il);
+                } break;
+            case LLM_FFN_SWIGLU_OAI_MOE:
+                {
+                    // TODO: move to hparams?
+                    constexpr float alpha = 1.702f;
+                    constexpr float limit = 7.0f;
+                    cur = ggml_swiglu_oai(ctx0, cur, up, alpha, limit);
+                    cb(cur, "ffn_moe_swiglu_oai", il);
+                } break;
+            case LLM_FFN_RELU:
+                if (has_gate) {
+                    cur = ggml_reglu_split(ctx0, cur, up);
+                    cb(cur, "ffn_moe_reglu", il);
+                } else {
+                    cur = ggml_relu(ctx0, cur);
+                    cb(cur, "ffn_moe_relu", il);
+                } break;
+            case LLM_FFN_RELU_SQR:
+                if (has_gate) {
+                    // TODO: add support for gated squared relu
+                    GGML_ABORT("fatal error: gated squared relu not implemented");
+                } else {
+                    cur = ggml_relu(ctx0, cur);
+                    cur = ggml_sqr(ctx0, cur);
+                    cb(cur, "ffn_moe_relu_sqr", il);
+                } break;
+            default:
+                GGML_ABORT("fatal error");
+        }
+
+        {
+            ggml_tensor * hot_down = hot_cache != nullptr
+                ? llama_moe_hot_cache_get_hot_down(hot_cache, il)
+                : nullptr;
+            if (hot_down != nullptr && hot_ids != nullptr) {
+                // Same dual-path treatment as gate/up: hot on compact VRAM buffer, cold on
+                // original tensor, summed via ggml_add. Bias and per-expert scale handling
+                // below runs unchanged on the merged result — sentinel-skipped slots are
+                // zero, so applying scales indexed by the original expert id remains
+                // correct.
+                ggml_tensor * down_hot  = build_lora_mm_id(hot_down,  cur, hot_ids);
+                ggml_tensor * down_cold = build_lora_mm_id(down_exps, cur, cold_ids);
+                down_hot ->op_params[0] = GGML_MUL_MAT_ID_FLAG_SENTINEL;
+                down_cold->op_params[0] = GGML_MUL_MAT_ID_FLAG_SENTINEL;
+                cb(down_hot,  "ffn_moe_down_hot",  il);
+                cb(down_cold, "ffn_moe_down_cold", il);
+                experts = ggml_add(ctx0, down_hot, down_cold);
+            } else {
+                experts = build_lora_mm_id(down_exps, cur, selected_experts); // [n_embd, n_expert_used, n_tokens]
             }
-
-            if (has_gate) {
-                cur = ggml_swiglu_split(ctx0, cur, up);
-                cb(cur, "ffn_moe_swiglu", il);
-            } else {
-                cur = ggml_silu(ctx0, cur);
-                cb(cur, "ffn_moe_silu", il);
-            } break;
-        case LLM_FFN_GELU:
-            if (has_gate) {
-                cur = ggml_geglu_split(ctx0, cur, up);
-                cb(cur, "ffn_moe_geglu", il);
-            } else {
-                cur = ggml_gelu(ctx0, cur);
-                cb(cur, "ffn_moe_gelu", il);
-            } break;
-        case LLM_FFN_SWIGLU_OAI_MOE:
-            {
-                // TODO: move to hparams?
-                constexpr float alpha = 1.702f;
-                constexpr float limit = 7.0f;
-                cur = ggml_swiglu_oai(ctx0, cur, up, alpha, limit);
-                cb(cur, "ffn_moe_swiglu_oai", il);
-            } break;
-        case LLM_FFN_RELU:
-            if (has_gate) {
-                cur = ggml_reglu_split(ctx0, cur, up);
-                cb(cur, "ffn_moe_reglu", il);
-            } else {
-                cur = ggml_relu(ctx0, cur);
-                cb(cur, "ffn_moe_relu", il);
-            } break;
-        case LLM_FFN_RELU_SQR:
-            if (has_gate) {
-                // TODO: add support for gated squared relu
-                GGML_ABORT("fatal error: gated squared relu not implemented");
-            } else {
-                cur = ggml_relu(ctx0, cur);
-                cur = ggml_sqr(ctx0, cur);
-                cb(cur, "ffn_moe_relu_sqr", il);
-            } break;
-        default:
-            GGML_ABORT("fatal error");
+        }
+        cb(experts, "ffn_moe_down", il);
     }
-
-    experts = build_lora_mm_id(down_exps, cur, selected_experts); // [n_embd, n_expert_used, n_tokens]
-    cb(experts, "ffn_moe_down", il);
 
     if (down_exps_b) {
         experts = ggml_add_id(ctx0, experts, down_exps_b, selected_experts);
