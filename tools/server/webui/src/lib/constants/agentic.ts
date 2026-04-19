@@ -40,6 +40,11 @@ export const LEGACY_REASONING_TAGS = {
 	END: '<<<reasoning_content_end>>>'
 } as const;
 
+export const RETRACTION_TAG = '<<<RETRACTED_START>>>';
+
+// Regex for trimming leading/trailing newlines
+export const TRIM_NEWLINES_REGEX = /^\n+|\n+$/g;
+
 /**
  * @deprecated Legacy regex patterns - only used for migration of old stored messages.
  */

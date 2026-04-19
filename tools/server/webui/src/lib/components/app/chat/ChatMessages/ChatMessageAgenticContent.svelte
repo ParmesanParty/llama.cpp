@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Wrench, Loader2, Brain } from '@lucide/svelte';
+	import { Wrench, Loader2, Brain, RotateCcw } from '@lucide/svelte';
 	import {
 		ChatMessageStatistics,
 		CollapsibleContentBlock,
@@ -323,6 +323,20 @@
 				</div>
 			</div>
 		</CollapsibleContentBlock>
+	{:else if section.type === AgenticSectionType.RETRACTED}
+		<CollapsibleContentBlock
+			open={isExpanded(index, section)}
+			class="my-2 retracted-block"
+			icon={RotateCcw}
+			iconClass="h-4 w-4 text-muted-foreground"
+			title="Superseded"
+			subtitle="re-generated below with search results"
+			onToggle={() => toggleExpanded(index, section)}
+		>
+			<div class="pt-3 opacity-50">
+				<MarkdownContent content={section.content.trim()} attachments={message?.extra} />
+			</div>
+		</CollapsibleContentBlock>
 	{/if}
 {/snippet}
 
@@ -409,5 +423,9 @@
 		margin-top: 0.75rem;
 		padding-top: 0.5rem;
 		border-top: 1px solid hsl(var(--muted) / 0.5);
+	}
+
+	:global(.retracted-block) {
+		opacity: 0.6;
 	}
 </style>

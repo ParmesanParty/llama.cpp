@@ -15,6 +15,7 @@
 	import { REASONING_TAGS } from '$lib/constants/agentic';
 	import { tick } from 'svelte';
 	import { fade } from 'svelte/transition';
+	import { RETRACTION_TAG } from '$lib/constants';
 	import { MessageRole, ChatMessageStatsView } from '$lib/enums';
 	import { config } from '$lib/stores/settings.svelte';
 	import { isRouterMode } from '$lib/stores/server.svelte';
@@ -75,6 +76,7 @@
 
 	const isAgentic = $derived(hasAgenticContent(message, toolMessages));
 	const hasReasoning = $derived(!!message.reasoningContent);
+	const hasRetractionMarker = $derived(messageContent?.includes(RETRACTION_TAG) ?? false);
 	const processingState = useProcessingState();
 
 	let currentConfig = $derived(config());
