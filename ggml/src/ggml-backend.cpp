@@ -771,6 +771,52 @@ struct ggml_backend_sched_split {
     struct ggml_cgraph graph;
 };
 
+// Expert frequency tracker: per-layer EMA of expert selection frequency.
+// Used to identify hot experts for GPU compute caching in MoE models.
+#define GGML_EXPERT_FREQ_MAX_LAYERS  128
+#define GGML_EXPERT_FREQ_MAX_EXPERTS 512
+
+struct expert_freq_tracker {
+    float    freq[GGML_EXPERT_FREQ_MAX_LAYERS][GGML_EXPERT_FREQ_MAX_EXPERTS]; // EMA frequencies
+    int      n_layers;   // detected layer count (0 = not yet seen)
+    int      n_experts;  // detected expert count per layer
+    uint64_t n_tokens;   // total tokens tracked
+    float    decay;      // EMA decay factor (e.g. 0.999)
+
+    void init(float decay_factor) {
+        memset(freq, 0, sizeof(freq));
+        n_layers  = 0;
+        n_experts = 0;
+        n_tokens  = 0;
+        decay     = decay_factor;
+    }
+
+    // Called once per layer per token with the set of selected expert IDs.
+    void record(int layer_id, const int32_t * expert_ids, int n_selected, int total_experts) {
+        if (layer_id < 0 || layer_id >= GGML_EXPERT_FREQ_MAX_LAYERS) return;
+        if (total_experts > GGML_EXPERT_FREQ_MAX_EXPERTS) return;
+
+        // update detected dimensions
+        if (layer_id >= n_layers)  n_layers  = layer_id + 1;
+        if (total_experts > n_experts) n_experts = total_experts;
+
+        // decay all experts in this layer
+        float * lf = freq[layer_id];
+        for (int i = 0; i < total_experts; i++) {
+            lf[i] *= decay;
+        }
+
+        // boost selected experts
+        float boost = 1.0f - decay;
+        for (int i = 0; i < n_selected; i++) {
+            int eid = expert_ids[i];
+            if (eid >= 0 && eid < total_experts) {
+                lf[eid] += boost;
+            }
+        }
+    }
+};
+
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
@@ -819,6 +865,9 @@ struct ggml_backend_sched {
     bool op_offload;
 
     int debug;
+
+    // expert frequency tracker — per-layer EMA of expert selection
+    expert_freq_tracker * exp_freq;     // NULL from calloc, lazy-init
 
     // used for debugging graph reallocations [GGML_SCHED_DEBUG_REALLOC]
     // ref: https://github.com/ggml-org/llama.cpp/pull/17617
@@ -1545,6 +1594,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
+    bool freq_token_counted = false;
+    std::vector<int32_t> freq_ids;     // reusable buffer for post-compute frequency tracking
+    std::vector<int32_t> freq_selected;
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
@@ -1713,6 +1765,57 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        // expert frequency tracking — post-compute scan for MUL_MAT_ID nodes
+        // runs after graph compute so IDs tensors contain actual routing decisions
+        if (sched->exp_freq != nullptr || split->graph.n_nodes > 0) {
+            ggml_tensor * prev_freq_ids = nullptr;
+            for (int j = 0; j < split->graph.n_nodes; j++) {
+                struct ggml_tensor * node = split->graph.nodes[j];
+                if (node->op != GGML_OP_MUL_MAT_ID) continue;
+
+                struct ggml_tensor * ids_tensor = node->src[2];
+                if (ids_tensor == prev_freq_ids) continue; // same routing for gate_up + down
+                prev_freq_ids = ids_tensor;
+
+                // lazy-init tracker on first MUL_MAT_ID encounter
+                if (sched->exp_freq == nullptr) {
+                    sched->exp_freq = new expert_freq_tracker();
+                    const char * decay_env = getenv("GGML_EXPERT_FREQ_DECAY");
+                    float decay_val = decay_env ? strtof(decay_env, nullptr) : 0.999f;
+                    if (decay_val <= 0.0f || decay_val >= 1.0f) decay_val = 0.999f;
+                    sched->exp_freq->init(decay_val);
+                }
+
+                // read the IDs tensor (small: n_expert_used * n_tokens int32s)
+                const int64_t n_expert = node->src[0]->ne[2]; // weight tensor dim 2
+                freq_ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
+                ggml_backend_synchronize(split_backend);
+                ggml_backend_tensor_get(ids_tensor, freq_ids.data(), 0, ggml_nbytes(ids_tensor));
+
+                // parse layer index from weight tensor name: "blk.%d.ffn_*_exps"
+                int layer_id = -1;
+                sscanf(node->src[0]->name, "blk.%d.", &layer_id);
+                if (layer_id < 0) continue;
+
+                // collect selected expert IDs
+                freq_selected.clear();
+                for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; i1++) {
+                    for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; i0++) {
+                        int32_t id = freq_ids[i1 * ids_tensor->nb[1]/sizeof(int32_t) + i0 * ids_tensor->nb[0]/sizeof(int32_t)];
+                        if (id >= 0 && id < n_expert) {
+                            freq_selected.push_back(id);
+                        }
+                    }
+                }
+
+                sched->exp_freq->record(layer_id, freq_selected.data(), (int)freq_selected.size(), (int)n_expert);
+                if (!freq_token_counted) {
+                    sched->exp_freq->n_tokens++;
+                    freq_token_counted = true;
+                }
+            }
+        }
+
         // record the event of this copy
         if (split->n_inputs > 0) {
             if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
@@ -1813,6 +1916,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched->prev_node_backend_ids);
     free(sched->prev_leaf_backend_ids);
     free(sched->context_buffer);
+    delete sched->exp_freq;
     free(sched->graph.nodes);
     free(sched->graph.leafs);
     free(sched);
@@ -1928,6 +2032,32 @@ int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {
 int ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     return sched->n_copies;
+}
+
+const float * ggml_backend_sched_get_expert_freq(ggml_backend_sched_t sched, int * n_layers, int * n_experts, uint64_t * n_tokens, int * stride, float * decay) {
+    GGML_ASSERT(sched);
+    if (sched->exp_freq == nullptr || sched->exp_freq->n_layers == 0) {
+        if (n_layers)  *n_layers  = 0;
+        if (n_experts) *n_experts = 0;
+        if (n_tokens)  *n_tokens  = 0;
+        if (stride)    *stride    = 0;
+        if (decay)     *decay     = 0.0f;
+        return nullptr;
+    }
+    if (n_layers)  *n_layers  = sched->exp_freq->n_layers;
+    if (n_experts) *n_experts = sched->exp_freq->n_experts;
+    if (n_tokens)  *n_tokens  = sched->exp_freq->n_tokens;
+    if (stride)    *stride    = GGML_EXPERT_FREQ_MAX_EXPERTS;
+    if (decay)     *decay     = sched->exp_freq->decay;
+    return &sched->exp_freq->freq[0][0];
+}
+
+void ggml_backend_sched_reset_expert_freq(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    if (sched->exp_freq != nullptr) {
+        float decay = sched->exp_freq->decay;
+        sched->exp_freq->init(decay);
+    }
 }
 
 int ggml_backend_sched_get_n_backends(ggml_backend_sched_t sched) {
