@@ -950,9 +950,20 @@ private:
         } else if (!params_base.model.name.empty()) {
             model_name = params_base.model.name;
         } else {
-            // fallback: derive model name from file name
-            auto model_path = std::filesystem::path(params_base.model.path);
-            model_name = model_path.filename().string();
+            // Try GGUF general.name metadata first
+            char buf[256] = {};
+            int len = llama_model_meta_val_str(model, "general.name", buf, sizeof(buf));
+            if (len > 0) {
+                model_name = std::string(buf, std::min(len, (int)sizeof(buf) - 1));
+            } else {
+                // Fallback: resolve symlinks and drop file extension
+                auto model_path = std::filesystem::path(params_base.model.path);
+                try {
+                    model_name = std::filesystem::canonical(model_path).stem().string();
+                } catch (...) {
+                    model_name = model_path.stem().string();
+                }
+            }
         }
 
         model_aliases = params_base.model_alias;
