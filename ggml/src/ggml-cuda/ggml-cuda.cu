@@ -2,6 +2,35 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
+// NVTX profiling ranges — emitted around each per-node CUDA dispatch so that
+// nsys (or any NVTX consumer) can attribute GPU wall time per tensor name.
+// Compiled out unless GGML_CUDA_NVTX is defined at build time (CMake opts in).
+#if defined(GGML_CUDA_NVTX)
+#  include <nvtx3/nvToolsExt.h>
+#  define GGML_CUDA_NVTX_PUSH(name) nvtxRangePushA(name)
+#  define GGML_CUDA_NVTX_POP()      nvtxRangePop()
+// RAII scope so the range always pops on leaving the enclosing block —
+// including the many `continue` paths through the fused-op dispatch ladder.
+struct ggml_cuda_nvtx_scoped_range {
+    explicit ggml_cuda_nvtx_scoped_range(const char * name) {
+        nvtxRangePushA(name);
+    }
+    ~ggml_cuda_nvtx_scoped_range() {
+        nvtxRangePop();
+    }
+};
+// Pick the node's `cb()` name when present (e.g. "ffn_moe_up_hot-<il>"), else
+// fall back to the op-kind ("MUL_MAT_ID"). Empty-name nodes are common for
+// intermediate reshapes / views so the fallback keeps every range labelled.
+#  define GGML_CUDA_NVTX_NODE_RANGE(node) \
+    ggml_cuda_nvtx_scoped_range _ggml_cuda_nvtx_guard( \
+        ((node)->name[0] != '\0') ? (node)->name : ggml_op_name((node)->op))
+#else
+#  define GGML_CUDA_NVTX_PUSH(name) ((void)0)
+#  define GGML_CUDA_NVTX_POP()      ((void)0)
+#  define GGML_CUDA_NVTX_NODE_RANGE(node) ((void)0)
+#endif
+
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
@@ -4420,6 +4449,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
+                // NVTX range covering every dispatch path out of this
+                // iteration — the `continue`s in the fused-op ladder below
+                // would otherwise orphan a Push without a matching Pop.
+                // Compiles to no-op unless GGML_CUDA_NVTX is defined.
+                GGML_CUDA_NVTX_NODE_RANGE(node);
                 if (is_concurrent_event_active) {
                     GGML_ASSERT(concurrent_event);
 
