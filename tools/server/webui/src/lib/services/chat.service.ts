@@ -5,6 +5,7 @@ import {
 	ATTACHMENT_LABEL_PDF_FILE,
 	ATTACHMENT_LABEL_MCP_PROMPT,
 	ATTACHMENT_LABEL_MCP_RESOURCE,
+	RETRACTION_TAG,
 	LEGACY_AGENTIC_REGEX
 } from '$lib/constants';
 import {
@@ -19,6 +20,48 @@ import type { DatabaseMessageExtraMcpPrompt, DatabaseMessageExtraMcpResource } f
 import { modelsStore } from '$lib/stores/models.svelte';
 
 export class ChatService {
+	/**
+	 * Strip content before a retraction marker (inclusive).
+	 * The model should not see hallucinated content from a prior nudge.
+	 */
+	private static stripRetractedContent(text: string): string {
+		const idx = text.indexOf(RETRACTION_TAG);
+		if (idx === -1) return text;
+		return text.slice(idx + RETRACTION_TAG.length);
+	}
+
+	private static stripReasoningContent(
+		content: ApiChatMessageData['content'] | null | undefined
+	): ApiChatMessageData['content'] | null | undefined {
+		if (!content) {
+			return content;
+		}
+
+		if (typeof content === 'string') {
+			return ChatService.stripRetractedContent(content)
+				.replace(LEGACY_AGENTIC_REGEX.REASONING_BLOCK, '')
+				.replace(LEGACY_AGENTIC_REGEX.REASONING_OPEN, '')
+				.replace(LEGACY_AGENTIC_REGEX.AGENTIC_TOOL_CALL_BLOCK, '')
+				.replace(LEGACY_AGENTIC_REGEX.AGENTIC_TOOL_CALL_OPEN, '');
+		}
+
+		if (!Array.isArray(content)) {
+			return content;
+		}
+
+		return content.map((part: ApiChatMessageContentPart) => {
+			if (part.type !== ContentPartType.TEXT || !part.text) return part;
+			return {
+				...part,
+				text: ChatService.stripRetractedContent(part.text)
+					.replace(LEGACY_AGENTIC_REGEX.REASONING_BLOCK, '')
+					.replace(LEGACY_AGENTIC_REGEX.REASONING_OPEN, '')
+					.replace(LEGACY_AGENTIC_REGEX.AGENTIC_TOOL_CALL_BLOCK, '')
+					.replace(LEGACY_AGENTIC_REGEX.AGENTIC_TOOL_CALL_OPEN, '')
+			};
+		});
+	}
+
 	/**
 	 *
 	 *
@@ -915,28 +958,6 @@ export class ChatService {
 	 *
 	 *
 	 */
-
-	/**
-	 * Strips legacy inline reasoning content tags from message content.
-	 * Handles both plain string content and multipart content arrays.
-	 */
-	private static stripReasoningContent(
-		content: string | ApiChatMessageContentPart[]
-	): string | ApiChatMessageContentPart[] {
-		const stripFromString = (text: string): string =>
-			text.replace(LEGACY_AGENTIC_REGEX.REASONING_BLOCK, '').trim();
-
-		if (typeof content === 'string') {
-			return stripFromString(content);
-		}
-
-		return content.map((part) => {
-			if (part.type === ContentPartType.TEXT && part.text) {
-				return { ...part, text: stripFromString(part.text) };
-			}
-			return part;
-		});
-	}
 
 	/**
 	 * Parses error response and creates appropriate error with context information

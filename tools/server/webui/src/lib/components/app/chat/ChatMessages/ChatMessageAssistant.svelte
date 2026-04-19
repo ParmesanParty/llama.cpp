@@ -22,7 +22,7 @@
 	import { Check, X } from '@lucide/svelte';
 	import { Button } from '$lib/components/ui/button';
 	import { Checkbox } from '$lib/components/ui/checkbox';
-	import { INPUT_CLASSES } from '$lib/constants';
+	import { AGENTIC_TAGS, INPUT_CLASSES, REASONING_TAGS, RETRACTION_TAG } from '$lib/constants';
 	import { MessageRole, KeyboardKey, ChatMessageStatsView } from '$lib/enums';
 	import Label from '$lib/components/ui/label/label.svelte';
 	import { config } from '$lib/stores/settings.svelte';
@@ -97,6 +97,7 @@
 
 	const isAgentic = $derived(hasAgenticContent(message, toolMessages));
 	const hasReasoning = $derived(!!message.reasoningContent);
+	const hasRetractionMarker = $derived(messageContent?.includes(RETRACTION_TAG) ?? false);
 	const processingState = useProcessingState();
 
 	let currentConfig = $derived(config());

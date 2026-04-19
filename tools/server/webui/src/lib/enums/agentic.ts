@@ -14,5 +14,6 @@ export enum AgenticSectionType {
 	TOOL_CALL_PENDING = 'tool_call_pending',
 	TOOL_CALL_STREAMING = 'tool_call_streaming',
 	REASONING = 'reasoning',
-	REASONING_PENDING = 'reasoning_pending'
+	REASONING_PENDING = 'reasoning_pending',
+	RETRACTED = 'retracted'
 }

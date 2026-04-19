@@ -1,5 +1,5 @@
 import { AgenticSectionType, MessageRole } from '$lib/enums';
-import { ATTACHMENT_SAVED_REGEX, NEWLINE_SEPARATOR } from '$lib/constants';
+import { ATTACHMENT_SAVED_REGEX, NEWLINE_SEPARATOR, RETRACTION_TAG } from '$lib/constants';
 import type { ApiChatCompletionToolCall } from '$lib/types/api';
 import type {
 	DatabaseMessage,
@@ -55,12 +55,30 @@ function deriveSingleTurnSections(
 		});
 	}
 
-	// 2. Text content
+	// 2. Text content (with retraction support)
 	if (message.content?.trim()) {
-		sections.push({
-			type: AgenticSectionType.TEXT,
-			content: message.content
-		});
+		const retractionIdx = message.content.indexOf(RETRACTION_TAG);
+		if (retractionIdx !== -1) {
+			const retractedContent = message.content.slice(0, retractionIdx).trim();
+			const afterContent = message.content.slice(retractionIdx + RETRACTION_TAG.length).trim();
+			if (retractedContent) {
+				sections.push({
+					type: AgenticSectionType.RETRACTED,
+					content: retractedContent
+				});
+			}
+			if (afterContent) {
+				sections.push({
+					type: AgenticSectionType.TEXT,
+					content: afterContent
+				});
+			}
+		} else {
+			sections.push({
+				type: AgenticSectionType.TEXT,
+				content: message.content
+			});
+		}
 	}
 
 	// 3. Persisted tool calls (from message.toolCalls field)
