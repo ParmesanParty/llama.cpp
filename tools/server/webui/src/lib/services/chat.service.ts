@@ -14,7 +14,7 @@ import {
 	ReasoningFormat,
 	UrlProtocol
 } from '$lib/enums';
-import type { ApiChatMessageContentPart, ApiChatCompletionToolCall } from '$lib/types/api';
+import type { ApiChatMessageContentPart, ApiChatCompletionToolCall, ApiCompactionMetadata } from '$lib/types/api';
 import type { DatabaseMessageExtraMcpPrompt, DatabaseMessageExtraMcpResource } from '$lib/types';
 import { modelsStore } from '$lib/stores/models.svelte';
 
@@ -52,6 +52,7 @@ export class ChatService {
 			onToolCallChunk,
 			onModel,
 			onTimings,
+			onCompaction,
 			// Tools for function calling
 			tools,
 			// Generation parameters
@@ -232,7 +233,8 @@ export class ChatService {
 					onModel,
 					onTimings,
 					conversationId,
-					signal
+					signal,
+					onCompaction
 				);
 
 				return;
@@ -242,7 +244,8 @@ export class ChatService {
 					onComplete,
 					onError,
 					onToolCallChunk,
-					onModel
+					onModel,
+					onCompaction
 				);
 			}
 		} catch (error) {
@@ -417,7 +420,8 @@ export class ChatService {
 		onModel?: (model: string) => void,
 		onTimings?: (timings?: ChatMessageTimings, promptProgress?: ChatMessagePromptProgress) => void,
 		conversationId?: string,
-		abortSignal?: AbortSignal
+		abortSignal?: AbortSignal,
+		onCompaction?: (metadata: ApiCompactionMetadata) => void
 	): Promise<void> {
 		const reader = response.body?.getReader();
 
@@ -524,6 +528,10 @@ export class ChatService {
 								lastTimings = timings;
 							}
 
+							if (parsed.compaction && onCompaction) {
+								onCompaction(parsed.compaction);
+							}
+
 							if (content) {
 								finalizeOpenToolCallBatch();
 								aggregatedContent += content;
@@ -596,7 +604,8 @@ export class ChatService {
 		) => void,
 		onError?: (error: Error) => void,
 		onToolCallChunk?: (chunk: string) => void,
-		onModel?: (model: string) => void
+		onModel?: (model: string) => void,
+		onCompaction?: (metadata: ApiCompactionMetadata) => void
 	): Promise<string> {
 		try {
 			const responseText = await response.text();
@@ -608,6 +617,10 @@ export class ChatService {
 			}
 
 			const data: ApiChatCompletionResponse = JSON.parse(responseText);
+
+			if (data.compaction && onCompaction) {
+				onCompaction(data.compaction);
+			}
 
 			const responseModel = ChatService.extractModelName(data);
 			if (responseModel) {

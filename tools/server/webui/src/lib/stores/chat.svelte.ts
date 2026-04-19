@@ -558,12 +558,16 @@ class ChatStore {
 
 		// Mutable state for the current message being streamed
 		let currentMessageId = assistantMessage.id;
-		let streamedContent = '';
-		let streamedReasoningContent = '';
-		let resolvedModel: string | null = null;
-		let modelPersisted = false;
+		let streamedContent = '',
+			streamedReasoningContent = '',
+			resolvedModel: string | null = null,
+			modelPersisted = false;
 		const convId = assistantMessage.convId;
-
+		// Track messages actually sent to the proxy for compaction index resolution
+		let sentMessages: DatabaseMessage[] | null = null;
+		let streamedExtras: DatabaseMessageExtra[] = assistantMessage.extra
+			? JSON.parse(JSON.stringify(assistantMessage.extra))
+			: [];
 		const recordModel = (modelName: string | null | undefined, persistImmediately = true): void => {
 			if (!modelName) return;
 			const n = normalizeModelName(modelName);
@@ -765,6 +769,30 @@ class ChatStore {
 					contextInfo
 				});
 				if (onError) onError(error);
+			},
+			onCompaction: (metadata: ApiCompactionMetadata) => {
+				// Resolve index against the messages actually sent to the proxy,
+				// not activeMessages (which includes the full history).
+				// sentMessages is set just before sendMessage() is called.
+				const msgs = sentMessages ?? conversationsStore.activeMessages;
+				const boundaryMsg = msgs[metadata.compacted_up_to_index];
+				if (boundaryMsg && conversationsStore.activeConversation) {
+					// Map synthetic summary message back to real messages:
+					// if boundary lands on the summary msg, use the first real
+					// message after it as the boundary.
+					const resolvedId =
+						boundaryMsg.id === 'compaction-summary'
+							? msgs[metadata.compacted_up_to_index + 1]?.id
+							: boundaryMsg.id;
+					if (!resolvedId) return;
+					const compaction: ConversationCompaction = {
+						summary: metadata.summary,
+						compactedUpToMessageId: resolvedId,
+						compactedMessageCount: metadata.compacted_message_count,
+						timestamp: Date.now()
+					};
+					conversationsStore.setCompaction(compaction);
+				}
 			}
 		};
 
@@ -783,52 +811,88 @@ class ChatStore {
 			if (agenticResult.handled) return;
 		}
 
+<<<<<<< HEAD
 		// Non-agentic path: direct streaming into the single assistant message
-		await ChatService.sendMessage(
-			allMessages,
-			{
-				...this.getApiOptions(),
-				...(effectiveModel ? { model: effectiveModel } : {}),
-				stream: true,
-				onChunk: streamCallbacks.onChunk,
-				onReasoningChunk: streamCallbacks.onReasoningChunk,
-				onModel: streamCallbacks.onModel,
-				onTimings: streamCallbacks.onTimings,
-				onComplete: async (
-					finalContent?: string,
-					reasoningContent?: string,
-					timings?: ChatMessageTimings,
-					toolCalls?: string
-				) => {
-					const content = streamedContent || finalContent || '';
-					const reasoning = streamedReasoningContent || reasoningContent;
-					const updateData: Record<string, unknown> = {
-						content,
-						reasoningContent: reasoning || undefined,
-						toolCalls: toolCalls || '',
-						timings
-					};
-					if (resolvedModel && !modelPersisted) updateData.model = resolvedModel;
-					await DatabaseService.updateMessage(currentMessageId, updateData);
-					const idx = conversationsStore.findMessageIndex(currentMessageId);
-					const uiUpdate: Partial<DatabaseMessage> = {
-						content,
-						reasoningContent: reasoning || undefined,
-						toolCalls: toolCalls || ''
-					};
-					if (timings) uiUpdate.timings = timings;
-					if (resolvedModel) uiUpdate.model = resolvedModel;
-					conversationsStore.updateMessageAtIndex(idx, uiUpdate);
-					await conversationsStore.updateCurrentNode(currentMessageId);
-					cleanupStreamingState();
-					if (onComplete) await onComplete(content);
-					if (isRouterMode()) modelsStore.fetchRouterModels().catch(console.error);
-				},
-				onError: streamCallbacks.onError
+		const completionOptions = {
+			...this.getApiOptions(),
+			...(effectiveModel ? { model: effectiveModel } : {}),
+			stream: true,
+			onChunk: streamCallbacks.onChunk,
+			onReasoningChunk: streamCallbacks.onReasoningChunk,
+			onModel: streamCallbacks.onModel,
+			onTimings: streamCallbacks.onTimings,
+			onComplete: async (
+				finalContent?: string,
+				reasoningContent?: string,
+				timings?: ChatMessageTimings,
+				toolCalls?: string
+			) => {
+				const content = streamedContent || finalContent || '';
+				const reasoning = streamedReasoningContent || reasoningContent;
+				const updateData: Record<string, unknown> = {
+					content,
+					reasoningContent: reasoning || undefined,
+					toolCalls: toolCalls || '',
+					timings
+				};
+				if (resolvedModel && !modelPersisted) updateData.model = resolvedModel;
+				await DatabaseService.updateMessage(currentMessageId, updateData);
+				const idx = conversationsStore.findMessageIndex(currentMessageId);
+				const uiUpdate: Partial<DatabaseMessage> = {
+					content,
+					reasoningContent: reasoning || undefined,
+					toolCalls: toolCalls || ''
+				};
+				if (timings) uiUpdate.timings = timings;
+				if (resolvedModel) uiUpdate.model = resolvedModel;
+				conversationsStore.updateMessageAtIndex(idx, uiUpdate);
+				await conversationsStore.updateCurrentNode(currentMessageId);
+				cleanupStreamingState();
+				if (onComplete) await onComplete(content);
+				if (isRouterMode()) modelsStore.fetchRouterModels().catch(console.error);
 			},
+			onError: streamCallbacks.onError
+		};
+
+		// Apply compaction if active — send summary + recent messages instead of full history
+		let messagesToSend: DatabaseMessage[] = allMessages;
+		const compaction = conversationsStore.activeConversation?.compaction;
+		if (compaction) {
+			messagesToSend = this.buildCompactedMessages(allMessages, compaction);
+		}
+		sentMessages = messagesToSend;
+
+		await ChatService.sendMessage(
+			messagesToSend,
+			completionOptions,
 			convId,
 			abortController.signal
 		);
+	}
+
+	private buildCompactedMessages(
+		messages: DatabaseMessage[],
+		compaction: ConversationCompaction
+	): DatabaseMessage[] {
+		const boundaryIndex = messages.findIndex(
+			(m) => m.id === compaction.compactedUpToMessageId
+		);
+		if (boundaryIndex < 0) return messages; // compaction invalid, send full
+
+		const systemMsg =
+			messages[0]?.role === 'system' ? [messages[0]] : [];
+		const summaryMsg: DatabaseMessage = {
+			id: 'compaction-summary',
+			convId: messages[0]?.convId ?? '',
+			type: 'text' as ChatMessageType,
+			timestamp: compaction.timestamp,
+			role: 'user' as ChatRole,
+			content: `[Summary of earlier conversation:]\n\n${compaction.summary}`,
+			parent: null,
+			children: []
+		};
+		const recentMsgs = messages.slice(boundaryIndex + 1);
+		return [...systemMsg, summaryMsg, ...recentMsgs];
 	}
 
 	async stopGeneration(): Promise<void> {
@@ -1343,6 +1407,10 @@ class ChatStore {
 		if (!result) return;
 		const { message: msg, index: idx } = result;
 		try {
+			// Clear compaction if editing a message in the compacted zone
+			if (activeConv.compaction) {
+				await conversationsStore.clearCompaction();
+			}
 			const allMessages = await conversationsStore.getConversationMessages(activeConv.id);
 			const rootMessage = allMessages.find((m) => m.type === 'root' && m.parent === null);
 			const isFirstUserMessage =
@@ -1536,10 +1604,20 @@ class ChatStore {
 		for (let i = messages.length - 1; i >= 0; i--) {
 			const message = messages[i];
 			if (message.role === MessageRole.ASSISTANT && message.timings) {
+				// Base context: prompt_n + predicted_n from last response = total context at that point
+				const basePrompt = message.timings.prompt_n || 0;
+				const basePredicted = message.timings.predicted_n || 0;
+
+				// Estimate tokens for any messages added after this assistant response
+				let additionalTokens = 0;
+				for (let j = i + 1; j < messages.length; j++) {
+					additionalTokens += ChatStore.estimateMessageTokens(messages[j]);
+				}
+
 				const restoredState = this.parseTimingData({
-					prompt_n: message.timings.prompt_n || 0,
+					prompt_n: basePrompt + basePredicted + additionalTokens,
 					prompt_ms: message.timings.prompt_ms,
-					predicted_n: message.timings.predicted_n || 0,
+					predicted_n: 0,
 					predicted_per_second:
 						message.timings.predicted_n && message.timings.predicted_ms
 							? (message.timings.predicted_n / message.timings.predicted_ms) * 1000
@@ -1552,6 +1630,40 @@ class ChatStore {
 				}
 			}
 		}
+
+		// No assistant message with timings — estimate from all messages
+		// Apply compaction if active (estimate from what would actually be sent)
+		if (messages.length > 0) {
+			const compaction = conversationsStore.activeConversation?.compaction;
+			const messagesToEstimate = compaction
+				? this.buildCompactedMessages(messages, compaction)
+				: messages;
+			let estimatedTokens = 0;
+			for (const msg of messagesToEstimate) {
+				estimatedTokens += ChatStore.estimateMessageTokens(msg);
+			}
+			const restoredState = this.parseTimingData({
+				prompt_n: estimatedTokens,
+				predicted_n: 0,
+				predicted_per_second: 0,
+				cache_n: 0
+			});
+			if (restoredState) {
+				this.setProcessingState(conversationId, restoredState);
+			}
+		}
+	}
+
+	/**
+	 * Estimate token count for a single message using character-ratio heuristic.
+	 * Ratios calibrated against llama-server's tokenizer (see tools/compaction.py).
+	 */
+	private static estimateMessageTokens(message: DatabaseMessage): number {
+		const len = message.content?.length || 0;
+		const role = message.role;
+		// Role-aware ratios (chars per token): system ~4.5, user ~3.8, assistant ~3.5
+		const ratio = role === 'system' ? 4.5 : role === 'user' ? 3.8 : 3.5;
+		return Math.ceil(len / ratio) + 4; // +4 for chat template overhead per message
 	}
 
 	getConversationModel(messages: DatabaseMessage[]): string | null {

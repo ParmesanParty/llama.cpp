@@ -5,6 +5,7 @@
 	import { chatStore, isLoading, isChatStreaming } from '$lib/stores/chat.svelte';
 	import { activeMessages, activeConversation } from '$lib/stores/conversations.svelte';
 	import { config } from '$lib/stores/settings.svelte';
+	import { contextSize } from '$lib/stores/server.svelte';
 
 	const processingState = useProcessingState();
 
@@ -46,6 +47,8 @@
 		const conversation = activeConversation();
 		const messages = activeMessages() as DatabaseMessage[];
 		const keepStatsVisible = config().keepStatsVisible;
+		// Track contextSize so restore re-runs when /props arrives (contextTotal depends on it)
+		const _serverCtx = contextSize();
 
 		if (keepStatsVisible && conversation) {
 			if (messages.length === 0) {

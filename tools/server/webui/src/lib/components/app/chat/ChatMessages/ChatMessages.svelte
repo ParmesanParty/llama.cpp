@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { fadeInView } from '$lib/actions/fade-in-view.svelte';
 	import { ChatMessage } from '$lib/components/app';
+	import CompactionBanner from '$lib/components/app/chat/CompactionBanner.svelte';
 	import { setChatActionsContext } from '$lib/contexts';
 	import { MessageRole } from '$lib/enums';
 	import { chatStore } from '$lib/stores/chat.svelte';
@@ -22,7 +23,9 @@
 	let { class: className, messages = [], onUserAction }: Props = $props();
 
 	let allConversationMessages = $state<DatabaseMessage[]>([]);
-	const currentConfig = config();
+	let summaryExpanded = $state(false);
+	let historyExpanded = $state(false);
+	let currentConfig = $derived(config());
 
 	setChatActionsContext({
 		copy: async (message: DatabaseMessage) => {
@@ -115,6 +118,22 @@
 		}
 	});
 
+	// Reset expansion state when conversation changes
+	$effect(() => {
+		activeConversation();
+		summaryExpanded = false;
+		historyExpanded = false;
+	});
+
+	// Compaction state from active conversation
+	let compaction = $derived(activeConversation()?.compaction);
+
+	// Find the boundary index for compacted messages
+	let compactionBoundaryIndex = $derived.by(() => {
+		if (!compaction || !messages.length) return -1;
+		return messages.findIndex((m) => m.id === compaction!.compactedUpToMessageId);
+	});
+
 	let displayMessages = $derived.by(() => {
 		if (!messages.length) {
 			return [];
@@ -192,23 +211,58 @@
 			}
 		}
 
-		return result;
+		// Annotate with compaction zone membership
+		return result.map((entry) => {
+			const origIndex = messages.indexOf(entry.message);
+			const isSystemMessage = entry.message.type === MessageRole.SYSTEM;
+			const isInCompactedRegion =
+				compactionBoundaryIndex >= 0 && !isSystemMessage && origIndex >= 0 && origIndex <= compactionBoundaryIndex;
+			const isCompactionBoundaryNext =
+				compactionBoundaryIndex >= 0 && origIndex === compactionBoundaryIndex + 1;
+
+			return { ...entry, isInCompactedRegion, isCompactionBoundaryNext };
+		});
 	});
 </script>
 
-<div
-	class="flex h-full flex-col space-y-10 pt-24 {className}"
-	style="height: auto; min-height: calc(100dvh - 14rem);"
->
-	{#each displayMessages as { message, toolMessages, isLastAssistantMessage, siblingInfo } (message.id)}
-		<div use:fadeInView>
-			<ChatMessage
-				class="mx-auto w-full max-w-[48rem]"
-				{message}
-				{toolMessages}
-				{isLastAssistantMessage}
-				{siblingInfo}
+<div class="flex h-full flex-col space-y-10 pt-24 {className}" style="height: auto; ">
+	{#each displayMessages as { message, toolMessages, isLastAssistantMessage, isInCompactedRegion, isCompactionBoundaryNext, siblingInfo } (message.id)}
+		{#if isCompactionBoundaryNext && compaction}
+			<CompactionBanner
+				summary={compaction.summary}
+				messageCount={compaction.compactedMessageCount}
+				{summaryExpanded}
+				{historyExpanded}
+				onToggleSummary={() => {
+					summaryExpanded = !summaryExpanded;
+					if (!summaryExpanded) historyExpanded = false;
+				}}
+				onToggleHistory={() => (historyExpanded = !historyExpanded)}
 			/>
-		</div>
+		{/if}
+
+		{#if isInCompactedRegion}
+			{#if historyExpanded}
+				<div class="opacity-50 border-l-2 border-base-content/20 pl-2">
+					<ChatMessage
+						class="mx-auto w-full max-w-[48rem]"
+						{message}
+						{toolMessages}
+						{isLastAssistantMessage}
+						{siblingInfo}
+					/>
+				</div>
+			{/if}
+		{:else}
+			<div use:fadeInView>
+				<ChatMessage
+					class="mx-auto w-full max-w-[48rem]"
+					{message}
+					{toolMessages}
+					{isLastAssistantMessage}
+					{siblingInfo}
+				/>
+			</div>
+		{/if}
 	{/each}
 </div>
