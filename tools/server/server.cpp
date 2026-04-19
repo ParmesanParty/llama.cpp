@@ -197,8 +197,6 @@ int main(int argc, char ** argv) {
     ctx_http.post("/v1/reranking",             ex_wrapper(routes.post_rerank));
     ctx_http.post("/keepalive",                ex_wrapper(routes.post_keepalive)); // public endpoint (no API key check)
     ctx_http.post("/sleep",                    ex_wrapper(routes.post_sleep));     // public endpoint (no API key check)
-    ctx_http.get ("/api/expert-freq",          ex_wrapper(routes.get_expert_freq)); // public endpoint (no API key check)
-    ctx_http.post("/api/expert-freq/reset",    ex_wrapper(routes.post_expert_freq_reset));
     ctx_http.post("/tokenize",                 ex_wrapper(routes.post_tokenize));
     ctx_http.post("/detokenize",               ex_wrapper(routes.post_detokenize));
     ctx_http.post("/apply-template",           ex_wrapper(routes.post_apply_template));

@@ -3450,57 +3450,6 @@ void server_routes::init_routes() {
         return res;
     };
 
-    this->get_expert_freq = [this](const server_http_req &) {
-        auto res = create_response(true); // bypass_sleep — don't wake model for telemetry read
-
-        llama_context * ctx = ctx_server.get_ctx();
-        if (ctx == nullptr) {
-            res->ok({{"layers", json::array()}, {"n_tokens", 0}, {"decay", 0}});
-            return res;
-        }
-
-        ggml_backend_sched_t sched = ctx->get_sched();
-        int n_layers = 0, n_experts = 0, freq_stride = 0;
-        uint64_t n_tokens = 0;
-        float decay = 0.0f;
-        const float * freq = ggml_backend_sched_get_expert_freq(sched, &n_layers, &n_experts, &n_tokens, &freq_stride, &decay);
-
-        json layers_arr = json::array();
-        if (freq != nullptr && freq_stride > 0) {
-            for (int l = 0; l < n_layers; l++) {
-                json freq_arr = json::array();
-                const float * lf = freq + l * freq_stride;
-                for (int e = 0; e < n_experts; e++) {
-                    freq_arr.push_back(lf[e]);
-                }
-                layers_arr.push_back({{"layer", l}, {"freq", std::move(freq_arr)}});
-            }
-        }
-
-        res->ok({
-            {"layers",   std::move(layers_arr)},
-            {"n_tokens", n_tokens},
-            {"n_layers", n_layers},
-            {"n_experts", n_experts},
-            {"decay",    decay},
-        });
-        return res;
-    };
-
-    this->post_expert_freq_reset = [this](const server_http_req &) {
-        auto res = create_response(true);
-
-        llama_context * ctx = ctx_server.get_ctx();
-        if (ctx == nullptr) {
-            res->ok({{"status", "ok"}, {"reset", false}});
-            return res;
-        }
-
-        ggml_backend_sched_reset_expert_freq(ctx->get_sched());
-        res->ok({{"status", "ok"}, {"reset", true}});
-        return res;
-    };
-
     this->get_metrics = [this](const server_http_req & req) {
         auto res = create_response();
         if (!params.endpoint_metrics) {
