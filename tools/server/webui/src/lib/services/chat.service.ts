@@ -1,12 +1,11 @@
-import { getJsonHeaders } from '$lib/utils/api-headers';
-import { formatAttachmentText } from '$lib/utils/formatters';
-import { isAbortError } from '$lib/utils/abort';
+import { getJsonHeaders, getStreamHeaders, formatAttachmentText, isAbortError } from '$lib/utils';
 import {
 	ATTACHMENT_LABEL_PDF_FILE,
 	ATTACHMENT_LABEL_MCP_PROMPT,
 	ATTACHMENT_LABEL_MCP_RESOURCE,
 	RETRACTION_TAG,
-	LEGACY_AGENTIC_REGEX
+	LEGACY_AGENTIC_REGEX,
+	REASONING_BOUNDARY
 } from '$lib/constants';
 import {
 	AttachmentType,
@@ -15,7 +14,15 @@ import {
 	ReasoningFormat,
 	UrlProtocol
 } from '$lib/enums';
-import type { ApiChatMessageContentPart, ApiChatCompletionToolCall, ApiCompactionMetadata } from '$lib/types/api';
+import type {
+	ApiChatMessageContentPart,
+	ApiChatCompletionToolCall,
+	ApiCompactionMetadata,
+	ApiToolStatusEvent,
+	ApiRetractionEvent,
+	ApiSourcesEvent,
+	ApiToolHealthEvent
+} from '$lib/types/api';
 import type { DatabaseMessageExtraMcpPrompt, DatabaseMessageExtraMcpResource } from '$lib/types';
 import { modelsStore } from '$lib/stores/models.svelte';
 
@@ -94,6 +101,10 @@ export class ChatService {
 			onModel,
 			onTimings,
 			onCompaction,
+			onToolStatus,
+			onRetraction,
+			onSources,
+			onToolHealth,
 			// Tools for function calling
 			tools,
 			// Generation parameters
@@ -248,7 +259,7 @@ export class ChatService {
 		try {
 			const response = await fetch(`./v1/chat/completions`, {
 				method: 'POST',
-				headers: getJsonHeaders(),
+				headers: stream ? getStreamHeaders() : getJsonHeaders(),
 				body: JSON.stringify(requestBody),
 				signal
 			});
@@ -266,16 +277,21 @@ export class ChatService {
 			if (stream) {
 				await ChatService.handleStreamResponse(
 					response,
-					onChunk,
-					onComplete,
-					onError,
-					onReasoningChunk,
-					onToolCallChunk,
-					onModel,
-					onTimings,
-					conversationId,
-					signal,
-					onCompaction
+					{
+						onChunk,
+						onComplete,
+						onError,
+						onReasoningChunk,
+						onToolCallChunk,
+						onModel,
+						onTimings,
+						onCompaction,
+						onToolStatus,
+						onRetraction,
+						onSources,
+						onToolHealth
+					},
+					signal
 				);
 
 				return;
@@ -436,34 +452,53 @@ export class ChatService {
 	 */
 
 	/**
-	 * Handles streaming response from the chat completion API
+	 * Handles streaming response from the chat completion API.
+	 * Parses both standard SSE data lines and typed event lines (from X-Stream-Features).
+	 *
 	 * @param response - The Response object from the fetch request
-	 * @param onChunk - Optional callback invoked for each content chunk received
-	 * @param onComplete - Optional callback invoked when the stream is complete with full response
-	 * @param onError - Optional callback invoked if an error occurs during streaming
-	 * @param onReasoningChunk - Optional callback invoked for each reasoning content chunk
-	 * @param conversationId - Optional conversation ID for per-conversation state tracking
+	 * @param callbacks - Callback functions for stream events
+	 * @param abortSignal - Optional signal to abort the stream
 	 * @returns {Promise<void>} Promise that resolves when streaming is complete
 	 * @throws {Error} if the stream cannot be read or parsed
 	 */
 	private static async handleStreamResponse(
 		response: Response,
-		onChunk?: (chunk: string) => void,
-		onComplete?: (
-			response: string,
-			reasoningContent?: string,
-			timings?: ChatMessageTimings,
-			toolCalls?: string
-		) => void,
-		onError?: (error: Error) => void,
-		onReasoningChunk?: (chunk: string) => void,
-		onToolCallChunk?: (chunk: string) => void,
-		onModel?: (model: string) => void,
-		onTimings?: (timings?: ChatMessageTimings, promptProgress?: ChatMessagePromptProgress) => void,
-		conversationId?: string,
-		abortSignal?: AbortSignal,
-		onCompaction?: (metadata: ApiCompactionMetadata) => void
+		callbacks: {
+			onChunk?: (chunk: string) => void;
+			onComplete?: (
+				response: string,
+				reasoningContent?: string,
+				timings?: ChatMessageTimings,
+				toolCalls?: string
+			) => void;
+			onError?: (error: Error) => void;
+			onReasoningChunk?: (chunk: string) => void;
+			onToolCallChunk?: (chunk: string) => void;
+			onModel?: (model: string) => void;
+			onTimings?: (timings?: ChatMessageTimings, promptProgress?: ChatMessagePromptProgress) => void;
+			onCompaction?: (metadata: ApiCompactionMetadata) => void;
+			onToolStatus?: (event: ApiToolStatusEvent) => void;
+			onRetraction?: (event: ApiRetractionEvent) => void;
+			onSources?: (event: ApiSourcesEvent) => void;
+			onToolHealth?: (event: ApiToolHealthEvent) => void;
+		},
+		abortSignal?: AbortSignal
 	): Promise<void> {
+		const {
+			onChunk,
+			onComplete,
+			onError,
+			onReasoningChunk,
+			onToolCallChunk,
+			onModel,
+			onTimings,
+			onCompaction,
+			onToolStatus,
+			onRetraction,
+			onSources,
+			onToolHealth
+		} = callbacks;
+
 		const reader = response.body?.getReader();
 
 		if (!reader) {
@@ -521,8 +556,41 @@ export class ChatService {
 			}
 		};
 
+		// Typed SSE event routing
+		const EVENT_PREFIX = 'event: ';
+		const routeTypedEvent = (eventType: string, data: string) => {
+			try {
+				const payload = JSON.parse(data);
+				switch (eventType) {
+					case 'tool_status':
+						onToolStatus?.(payload as ApiToolStatusEvent);
+						break;
+					case 'retraction':
+						onRetraction?.(payload as ApiRetractionEvent);
+						break;
+					case 'compaction':
+						onCompaction?.(payload as ApiCompactionMetadata);
+						break;
+					case 'sources':
+						onSources?.(payload as ApiSourcesEvent);
+						break;
+					case 'tool_health':
+						onToolHealth?.(payload as ApiToolHealthEvent);
+						break;
+					default:
+						if (import.meta.env.DEV) {
+							console.warn('[ChatService] Unknown SSE event type:', eventType);
+						}
+				}
+			} catch (e) {
+				console.error('[ChatService] Error parsing typed SSE event:', eventType, e);
+			}
+		};
+
 		try {
 			let chunk = '';
+			let pendingEventType: string | null = null;
+
 			while (true) {
 				if (abortSignal?.aborted) break;
 
@@ -538,8 +606,22 @@ export class ChatService {
 				for (const line of lines) {
 					if (abortSignal?.aborted) break;
 
+					// Typed SSE event: "event: <type>" line precedes its "data: " line
+					if (line.startsWith(EVENT_PREFIX)) {
+						pendingEventType = line.slice(EVENT_PREFIX.length).trim();
+						continue;
+					}
+
 					if (line.startsWith(UrlProtocol.DATA)) {
 						const data = line.slice(6);
+
+						// Route typed events to their handlers
+						if (pendingEventType) {
+							routeTypedEvent(pendingEventType, data);
+							pendingEventType = null;
+							continue;
+						}
+
 						if (data === '[DONE]') {
 							streamFinished = true;
 
@@ -809,7 +891,7 @@ export class ChatService {
 			};
 
 			if (message.reasoningContent) {
-				result.reasoning_content = message.reasoningContent;
+				result.reasoning_content = message.reasoningContent.replaceAll(REASONING_BOUNDARY, '');
 			}
 
 			if (toolCalls && toolCalls.length > 0) {
@@ -941,7 +1023,7 @@ export class ChatService {
 			content: contentParts
 		};
 		if (message.reasoningContent) {
-			result.reasoning_content = message.reasoningContent;
+			result.reasoning_content = message.reasoningContent.replaceAll(REASONING_BOUNDARY, '');
 		}
 		if (toolCalls && toolCalls.length > 0) {
 			result.tool_calls = toolCalls;

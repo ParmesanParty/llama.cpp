@@ -36,7 +36,8 @@ import {
 import {
 	MAX_INACTIVE_CONVERSATION_STATES,
 	INACTIVE_CONVERSATION_STATE_MAX_AGE_MS,
-	SYSTEM_MESSAGE_PLACEHOLDER
+	SYSTEM_MESSAGE_PLACEHOLDER,
+	REASONING_BOUNDARY
 } from '$lib/constants';
 import type {
 	ChatMessageTimings,
@@ -44,7 +45,13 @@ import type {
 	ChatStreamCallbacks,
 	ErrorDialogState
 } from '$lib/types/chat';
-import type { ApiProcessingState, DatabaseMessage, DatabaseMessageExtra } from '$lib/types';
+import { createStreamEventHandlers } from '$lib/stores/stream-event-handlers';
+import type {
+	ApiProcessingState,
+	DatabaseMessage,
+	DatabaseMessageExtra,
+	StreamEvent
+} from '$lib/types';
 import { ErrorDialogType, MessageRole, MessageType } from '$lib/enums';
 
 interface ConversationStateEntry {
@@ -560,6 +567,7 @@ class ChatStore {
 		let currentMessageId = assistantMessage.id;
 		let streamedContent = '',
 			streamedReasoningContent = '',
+			reasoningBoundaryOffset = 0,
 			resolvedModel: string | null = null,
 			modelPersisted = false;
 		const convId = assistantMessage.convId;
@@ -568,6 +576,15 @@ class ChatStore {
 		let streamedExtras: DatabaseMessageExtra[] = assistantMessage.extra
 			? JSON.parse(JSON.stringify(assistantMessage.extra))
 			: [];
+		let streamedEvents: StreamEvent[] = [];
+
+		// Compute content offset excluding reasoning tags (reasoning renders separately)
+		const contentOffset = () =>
+			streamedContent
+				.replace(/<<<reasoning_content_start>>>[\s\S]*?<<<reasoning_content_end>>>/g, '')
+				.replace(/<<<reasoning_content_start>>>[\s\S]*$/, '')
+				.length;
+
 		const recordModel = (modelName: string | null | undefined, persistImmediately = true): void => {
 			if (!modelName) return;
 			const n = normalizeModelName(modelName);
@@ -589,6 +606,25 @@ class ChatStore {
 			const idx = conversationsStore.findMessageIndex(currentMessageId);
 			conversationsStore.updateMessageAtIndex(idx, { content: streamedContent });
 		};
+
+		// Flush reasoning state to the message — called by onToolStatus to close
+		// an open reasoning block before tool execution begins. Inserts a boundary
+		// marker so the renderer can split per-iteration reasoning blocks.
+		const finalizeReasoning = () => {
+			if (!streamedReasoningContent) return;
+			// Only insert boundary if new reasoning arrived since the last one
+			if (streamedReasoningContent.length > reasoningBoundaryOffset) {
+				streamedReasoningContent += REASONING_BOUNDARY;
+				reasoningBoundaryOffset = streamedReasoningContent.length;
+			}
+			const idx = conversationsStore.findMessageIndex(currentMessageId);
+			conversationsStore.updateMessageAtIndex(idx, {
+				reasoningContent: streamedReasoningContent
+			});
+		};
+
+		// Alias for onToolStatus compatibility — flush content to UI.
+		const updateStreamingContent = () => updateStreamingUI();
 
 		const cleanupStreamingState = () => {
 			this.setStreamingActive(false);
@@ -662,6 +698,8 @@ class ChatStore {
 					toolCalls: toolCalls ? JSON.stringify(toolCalls) : '',
 					timings
 				};
+				if (streamedExtras.length > 0) updateData.extra = streamedExtras;
+				if (streamedEvents.length > 0) updateData.streamEvents = streamedEvents;
 				if (resolvedModel && !modelPersisted) updateData.model = resolvedModel;
 				await DatabaseService.updateMessage(currentMessageId, updateData);
 				const idx = conversationsStore.findMessageIndex(currentMessageId);
@@ -670,6 +708,8 @@ class ChatStore {
 					reasoningContent: reasoningContent || undefined,
 					toolCalls: toolCalls ? JSON.stringify(toolCalls) : ''
 				};
+				if (streamedExtras.length > 0) uiUpdate.extra = streamedExtras;
+				if (streamedEvents.length > 0) uiUpdate.streamEvents = streamedEvents;
 				if (timings) uiUpdate.timings = timings;
 				if (resolvedModel) uiUpdate.model = resolvedModel;
 				conversationsStore.updateMessageAtIndex(idx, uiUpdate);
@@ -770,30 +810,19 @@ class ChatStore {
 				});
 				if (onError) onError(error);
 			},
-			onCompaction: (metadata: ApiCompactionMetadata) => {
-				// Resolve index against the messages actually sent to the proxy,
-				// not activeMessages (which includes the full history).
-				// sentMessages is set just before sendMessage() is called.
-				const msgs = sentMessages ?? conversationsStore.activeMessages;
-				const boundaryMsg = msgs[metadata.compacted_up_to_index];
-				if (boundaryMsg && conversationsStore.activeConversation) {
-					// Map synthetic summary message back to real messages:
-					// if boundary lands on the summary msg, use the first real
-					// message after it as the boundary.
-					const resolvedId =
-						boundaryMsg.id === 'compaction-summary'
-							? msgs[metadata.compacted_up_to_index + 1]?.id
-							: boundaryMsg.id;
-					if (!resolvedId) return;
-					const compaction: ConversationCompaction = {
-						summary: metadata.summary,
-						compactedUpToMessageId: resolvedId,
-						compactedMessageCount: metadata.compacted_message_count,
-						timestamp: Date.now()
-					};
-					conversationsStore.setCompaction(compaction);
-				}
-			}
+			...createStreamEventHandlers({
+				streamedEvents,
+				contentOffset,
+				finalizeReasoning,
+				updateStreamingContent,
+				findMessageIndex: (id) => conversationsStore.findMessageIndex(id),
+				updateMessageAtIndex: (idx, data) => conversationsStore.updateMessageAtIndex(idx, data),
+				assistantMessageId: assistantMessage.id,
+				sentMessages: () => sentMessages,
+				activeMessages: () => conversationsStore.activeMessages,
+				activeConversation: () => conversationsStore.activeConversation,
+				setCompaction: (c) => conversationsStore.setCompaction(c)
+			})
 		};
 
 		const perChatOverrides = conversationsStore.activeConversation?.mcpServerOverrides;
@@ -811,7 +840,6 @@ class ChatStore {
 			if (agenticResult.handled) return;
 		}
 
-<<<<<<< HEAD
 		// Non-agentic path: direct streaming into the single assistant message
 		const completionOptions = {
 			...this.getApiOptions(),
@@ -821,6 +849,11 @@ class ChatStore {
 			onReasoningChunk: streamCallbacks.onReasoningChunk,
 			onModel: streamCallbacks.onModel,
 			onTimings: streamCallbacks.onTimings,
+			onToolStatus: streamCallbacks.onToolStatus,
+			onRetraction: streamCallbacks.onRetraction,
+			onSources: streamCallbacks.onSources,
+			onToolHealth: streamCallbacks.onToolHealth,
+			onCompaction: streamCallbacks.onCompaction,
 			onComplete: async (
 				finalContent?: string,
 				reasoningContent?: string,
@@ -835,6 +868,7 @@ class ChatStore {
 					toolCalls: toolCalls || '',
 					timings
 				};
+				if (streamedEvents.length > 0) updateData.streamEvents = streamedEvents;
 				if (resolvedModel && !modelPersisted) updateData.model = resolvedModel;
 				await DatabaseService.updateMessage(currentMessageId, updateData);
 				const idx = conversationsStore.findMessageIndex(currentMessageId);
@@ -843,6 +877,7 @@ class ChatStore {
 					reasoningContent: reasoning || undefined,
 					toolCalls: toolCalls || ''
 				};
+				if (streamedEvents.length > 0) uiUpdate.streamEvents = streamedEvents;
 				if (timings) uiUpdate.timings = timings;
 				if (resolvedModel) uiUpdate.model = resolvedModel;
 				conversationsStore.updateMessageAtIndex(idx, uiUpdate);
