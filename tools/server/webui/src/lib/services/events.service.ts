@@ -24,11 +24,11 @@ export class EventsService {
 		this.eventSource = new EventSource('/api/events');
 
 		this.eventSource.onopen = () => {
-			// On every connect/reconnect, reconcile state from server
-			// Don't reset switching — fetchPresets() and SSE events drive that flag
+			// Reconcile on every connect/reconnect — presets may have changed
+			// while disconnected.  Layout also fires an eager fetchPresets()
+			// on mount so the model switcher doesn't wait for SSE.
 			modelsStore.fetchPresets();
 			// Skip redundant props fetch on initial connect — layout handles it.
-			// On reconnect, re-fetch to reconcile (state may have changed while disconnected).
 			if (this.hasConnected) {
 				serverStore.fetch();
 			}

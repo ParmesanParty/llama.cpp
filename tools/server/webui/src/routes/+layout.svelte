@@ -125,10 +125,8 @@
 		}
 	});
 
-	// Initialize server properties and presets on app load (run once)
+	// Initialize server properties on app load (run once)
 	$effect(() => {
-		// Only fetch if we don't already have props
-		// Presets fetched by EventsService.onopen — no need to duplicate here
 		if (!serverStore.props) {
 			untrack(() => {
 				serverStore.fetch();
@@ -136,7 +134,18 @@
 		}
 	});
 
-	// Connect to SSE events (onopen handler fetches presets and server state)
+	// [parmesan] Eager preset fetch — don't wait for SSE onopen to discover
+	// switchable models.  EventsService.onopen still re-fetches on reconnect
+	// to reconcile after disconnects.
+	$effect(() => {
+		if (browser) {
+			untrack(() => {
+				modelsStore.fetchPresets();
+			});
+		}
+	});
+
+	// Connect to SSE events (onopen handler re-fetches presets on reconnect)
 	$effect(() => {
 		if (browser) {
 			untrack(() => {
