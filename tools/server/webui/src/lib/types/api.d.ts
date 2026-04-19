@@ -497,3 +497,44 @@ export interface ApiRouterModelsUnloadResponse {
 	success: boolean;
 	error?: string;
 }
+
+// ── Preset model switching (proxy-managed) ─────────────────────────────────
+
+export interface PresetSamplingInfo {
+	temp?: number;
+	top_p?: number;
+	top_k?: number;
+	min_p?: number;
+	presence_penalty?: number;
+	n_predict?: number;
+	reasoning_format?: string;
+}
+
+export interface PresetThinkingInfo {
+	temp?: number;
+	top_p?: number;
+}
+
+export interface PresetInfo {
+	friendly_name: string;
+	filename: string;
+	size_approx: string;
+	ctx_size: number | null;
+	kv_cache: [string, string];
+	gpu_offload: string | null;
+	sampling: PresetSamplingInfo | null;
+	thinking: PresetThinkingInfo | null;
+	downloaded: boolean;
+}
+
+export interface PresetManifest {
+	presets: Record<string, PresetInfo>;
+	active: string | null;
+}
+
+export interface SwitchModelResponse {
+	status: string;
+	model: string;
+	friendly_name: string;
+	error?: string;
+}
