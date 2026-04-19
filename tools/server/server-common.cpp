@@ -12,6 +12,13 @@
 #include <random>
 #include <sstream>
 #include <fstream>
+#include <chrono>
+
+#include <sys/stat.h>
+
+// Protects mutable system_prompt/system_prompt_mtime in server_chat_params
+// from concurrent httplib worker threads during hot-reload
+static std::mutex mutex_system_prompt;
 
 json format_error_response(const std::string & message, const enum error_type type) {
     std::string type_str;
@@ -1025,6 +1032,104 @@ json oaicompat_chat_params_parse(
 
             } else if (type != "text") {
                 throw std::invalid_argument("unsupported content[].type");
+            }
+        }
+    }
+
+    // System prompt injection: prepend if configured and client didn't provide one
+    // Lock protects mutable system_prompt/system_prompt_mtime from concurrent requests
+    std::lock_guard<std::mutex> sp_lock(mutex_system_prompt);
+    if (!opt.system_prompt.empty() || !opt.system_prompt_path.empty()) {
+        // Hot-reload from file if path is set
+        if (!opt.system_prompt_path.empty()) {
+            struct stat st;
+            if (stat(opt.system_prompt_path.c_str(), &st) == 0 && st.st_mtime != opt.system_prompt_mtime) {
+                std::ifstream ifs(opt.system_prompt_path);
+                if (ifs.is_open()) {
+                    std::string content((std::istreambuf_iterator<char>(ifs)),
+                                         std::istreambuf_iterator<char>());
+                    while (!content.empty() && content.back() == '\n') {
+                        content.pop_back();
+                    }
+                    opt.system_prompt = std::move(content);
+                    opt.system_prompt_mtime = st.st_mtime;
+                }
+            }
+        }
+        if (!opt.system_prompt.empty()) {
+            bool has_system = !messages.empty() && messages[0].at("role") == "system";
+            if (!has_system) {
+                // Append current date + time-of-day bucket for temporal grounding
+                auto now = std::chrono::system_clock::now();
+                std::time_t now_t = std::chrono::system_clock::to_time_t(now);
+                std::tm tm_buf;
+                localtime_r(&now_t, &tm_buf);
+
+                // Date string: "Tuesday, March 18, 2026"
+                char date_buf[64];
+                std::strftime(date_buf, sizeof(date_buf), "%A, %B %e, %Y", &tm_buf);
+                std::string date_str(date_buf);
+                auto pos = date_str.find("  ");
+                if (pos != std::string::npos) {
+                    date_str.erase(pos, 1);
+                }
+
+                // Time-of-day bucket
+                int hour = tm_buf.tm_hour;
+                struct bucket { const char* label; int start; int end; };
+                static const bucket buckets[] = {
+                    {"late night",    0,  3},
+                    {"early morning", 4,  6},
+                    {"morning",       7, 10},
+                    {"midday",       11, 13},
+                    {"afternoon",    14, 16},
+                    {"evening",      17, 20},
+                    {"night",        21, 23},
+                };
+                const bucket* b = &buckets[0]; // default: late night
+                for (const auto& bk : buckets) {
+                    if (hour >= bk.start && hour <= bk.end) {
+                        b = &bk;
+                        break;
+                    }
+                }
+
+                // Timezone abbreviation
+                char tz_buf[16] = "";
+                std::strftime(tz_buf, sizeof(tz_buf), "%Z", &tm_buf);
+                std::string tz_str(tz_buf);
+
+                // Format: "Current date: Tuesday, March 18, 2026, 7:30 PM CDT (evening, 17:00–20:59)"
+                char bucket_buf[64];
+                std::snprintf(bucket_buf, sizeof(bucket_buf), "%s, %02d:00\xe2\x80\x93%02d:59",
+                              b->label, b->start, b->end);
+
+                // MIRROR: /home/albertnam/code/llm-server/tools/temporal.py
+                // (format_temporal_line). Both paths must produce byte-identical
+                // output; otherwise the proxy's _patch_temporal_context will fail
+                // to match this line and append a duplicate.
+                // 12-hour clock with no zero-pad on hour ("2:32 PM"), to match
+                // tools/temporal.py's Python strftime("%-I:%M %p"). Hand-rolled
+                // because %-I is a glibc extension and warns under ISO C++.
+                int hour_12 = tm_buf.tm_hour % 12;
+                if (hour_12 == 0) hour_12 = 12;
+                const char * am_pm = tm_buf.tm_hour < 12 ? "AM" : "PM";
+                char time_buf[32];
+                std::snprintf(time_buf, sizeof(time_buf), "%d:%02d %s",
+                              hour_12, tm_buf.tm_min, am_pm);
+                std::string time_str(time_buf);
+                if (!tz_str.empty()) {
+                    time_str += " " + tz_str;
+                }
+
+                std::string temporal = std::string("Current date: ") + date_str + ", " + time_str
+                                     + " (" + bucket_buf + ")";
+
+                std::string full_prompt = opt.system_prompt + "\n\n" + temporal;
+                messages.insert(messages.begin(), json{
+                    {"role", "system"},
+                    {"content", full_prompt}
+                });
             }
         }
     }
