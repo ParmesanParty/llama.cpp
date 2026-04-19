@@ -7,7 +7,10 @@
 		Monitor,
 		ChevronLeft,
 		ChevronRight,
-		Database
+		ChevronDown,
+		Database,
+		Brain,
+		RotateCcw
 	} from '@lucide/svelte';
 	import {
 		ChatSettingsFooter,
@@ -18,6 +21,7 @@
 	} from '$lib/components/app';
 	import { ScrollArea } from '$lib/components/ui/scroll-area';
 	import { config, settingsStore } from '$lib/stores/settings.svelte';
+	import { serverStore } from '$lib/stores/server.svelte';
 	import {
 		SETTINGS_SECTION_TITLES,
 		type SettingsSectionTitle,
@@ -360,6 +364,22 @@
 	let canScrollRight = $state(false);
 	let scrollContainer: HTMLDivElement | undefined = $state();
 
+	let thinkingExpanded = $state(true);
+	let localThinkingOverrides = $state<Record<string, number>>({ ...settingsStore.thinkingOverrides });
+
+	function paramDisplayName(param: string): string {
+		const names: Record<string, string> = {
+			temperature: 'Temperature',
+			top_p: 'Top P',
+			top_k: 'Top K',
+			min_p: 'Min P',
+			max_tokens: 'Max tokens',
+			presence_penalty: 'Presence penalty',
+			frequency_penalty: 'Frequency penalty',
+		};
+		return names[param] ?? param;
+	}
+
 	$effect(() => {
 		if (initialSection) {
 			activeSection = initialSection;
@@ -378,6 +398,7 @@
 
 	function handleReset() {
 		localConfig = { ...config() };
+		localThinkingOverrides = { ...settingsStore.thinkingOverrides };
 
 		setMode(localConfig.theme as ColorMode);
 	}
@@ -413,6 +434,18 @@
 		}
 
 		settingsStore.updateMultipleConfig(processedConfig);
+
+		// Persist thinking override changes
+		for (const [param, value] of Object.entries(localThinkingOverrides)) {
+			const serverOv = serverStore.thinkingOverrides;
+			const serverValue = serverOv?.[param];
+			if (serverValue !== undefined && value !== serverValue) {
+				settingsStore.setThinkingOverride(param, value);
+			} else if (serverValue !== undefined && value === serverValue) {
+				settingsStore.resetThinkingOverride(param, serverValue);
+			}
+		}
+
 		onSave?.();
 	}
 
@@ -451,6 +484,7 @@
 
 	export function reset() {
 		localConfig = { ...config() };
+		localThinkingOverrides = { ...settingsStore.thinkingOverrides };
 
 		setTimeout(updateScrollButtons, 100);
 	}
@@ -566,6 +600,73 @@
 							onConfigChange={handleConfigChange}
 							onThemeChange={handleThemeChange}
 						/>
+
+						{#if currentSection.title === SETTINGS_SECTION_TITLES.SAMPLING && settingsStore.hasThinkingOverrides}
+							<p class="text-xs italic text-muted-foreground">
+								When thinking is enabled, the overrides below replace the corresponding sampling values.
+							</p>
+
+							<div class="border-t border-border/30 pt-4">
+								<button
+									class="flex w-full items-center gap-2 text-sm font-medium text-foreground"
+									onclick={() => thinkingExpanded = !thinkingExpanded}
+								>
+									<Brain class="h-4 w-4" />
+									<span>Thinking Mode Overrides</span>
+									<ChevronDown class="ml-auto h-4 w-4 transition-transform {thinkingExpanded ? 'rotate-180' : ''}" />
+								</button>
+
+								{#if thinkingExpanded}
+									<div class="mt-3 space-y-3">
+										{#each Object.entries(localThinkingOverrides) as [param, value]}
+											{@const serverOv = serverStore.thinkingOverrides}
+											{@const serverValue = serverOv?.[param]}
+											{@const isCustom = serverValue !== undefined && value !== serverValue}
+											<div class="space-y-1">
+												<div class="flex items-center gap-2">
+													<label for="thinking-{param}" class="text-sm font-medium">
+														{paramDisplayName(param)}
+													</label>
+													{#if isCustom}
+														<span class="rounded bg-accent px-1.5 py-0.5 text-[10px] font-medium text-accent-foreground">
+															Custom
+														</span>
+														<button
+															class="inline-flex h-5 w-5 items-center justify-center rounded transition-colors hover:bg-muted"
+															title="Reset to server default"
+															onclick={() => {
+																if (serverValue !== undefined) {
+																	localThinkingOverrides[param] = serverValue;
+																}
+															}}
+														>
+															<RotateCcw class="h-3 w-3" />
+														</button>
+													{:else}
+														<span class="rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
+															Default
+														</span>
+													{/if}
+												</div>
+												<input
+													id="thinking-{param}"
+													type="number"
+													step="0.01"
+													value={value}
+													onchange={(e) => {
+														const v = parseFloat(e.currentTarget.value);
+														if (!isNaN(v)) {
+															localThinkingOverrides[param] = v;
+														}
+													}}
+													class="h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm transition-colors md:max-w-md"
+												/>
+											</div>
+										{/each}
+									</div>
+								{/if}
+							</div>
+						{/if}
 					</div>
 				{/if}
 			</div>
