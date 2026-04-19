@@ -12,6 +12,7 @@
 		predictedMs?: number;
 		promptTokens?: number;
 		promptMs?: number;
+		cachedTokens?: number;
 		isLive?: boolean;
 		isProcessingPrompt?: boolean;
 		initialView?: ChatMessageStatsView;
@@ -25,6 +26,7 @@
 		predictedMs,
 		promptTokens,
 		promptMs,
+		cachedTokens,
 		isLive = false,
 		isProcessingPrompt = false,
 		initialView = ChatMessageStatsView.GENERATION,
@@ -281,22 +283,31 @@
 			<ChatMessageStatisticsBadge
 				class="bg-transparent"
 				icon={WholeWord}
-				value="{promptTokens} tokens"
-				tooltipLabel="Prompt tokens"
+				value="{promptTokens!.toLocaleString()} new"
+				tooltipLabel="Prompt tokens freshly processed (uncached)"
 			/>
+
+			{#if cachedTokens !== undefined && cachedTokens > 0}
+				<ChatMessageStatisticsBadge
+					class="bg-transparent"
+					icon={Layers}
+					value="{cachedTokens.toLocaleString()} cached"
+					tooltipLabel="Prompt tokens served from cache (KV cache hit)"
+				/>
+			{/if}
 
 			<ChatMessageStatisticsBadge
 				class="bg-transparent"
 				icon={Clock}
 				value={formattedPromptTime ?? '0s'}
-				tooltipLabel="Prompt processing time"
+				tooltipLabel="Prompt processing time (uncached portion)"
 			/>
 
 			<ChatMessageStatisticsBadge
 				class="bg-transparent"
 				icon={Gauge}
 				value="{promptTokensPerSecond!.toFixed(2)} tokens/s"
-				tooltipLabel="Prompt processing speed"
+				tooltipLabel="Prompt processing speed (uncached portion)"
 			/>
 		{/if}
 	</div>
