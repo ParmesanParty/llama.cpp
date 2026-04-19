@@ -23,6 +23,7 @@ import { browser } from '$app/environment';
 import { toast } from 'svelte-sonner';
 import { DatabaseService } from '$lib/services/database.service';
 import { config } from '$lib/stores/settings.svelte';
+import { serverStore } from '$lib/stores/server.svelte';
 import {
 	filterByLeafNodeId,
 	findLeafNode,
@@ -293,7 +294,8 @@ class ConversationsStore {
 			this.pendingMcpServerOverrides = [];
 			this.activeConversation = conversation;
 			this.activeThinkingEnabled = conversation.enableThinking ?? !!config().enableThinking;
-			this.activePreserveThinking = conversation.preserveThinking ?? false;
+			this.activePreserveThinking =
+				conversation.preserveThinking ?? serverStore.preserveThinkingSupported;
 
 			if (conversation.currNode) {
 				const allMessages = await DatabaseService.getConversationMessages(convId);
@@ -324,7 +326,7 @@ class ConversationsStore {
 		// reload MCP defaults so new chats inherit persisted state
 		this.pendingMcpServerOverrides = ConversationsStore.loadMcpDefaults();
 		this.activeThinkingEnabled = !!config().enableThinking;
-		this.activePreserveThinking = false;
+		this.activePreserveThinking = serverStore.preserveThinkingSupported;
 	}
 
 	/**

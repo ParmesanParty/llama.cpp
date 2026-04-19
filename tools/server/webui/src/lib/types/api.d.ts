@@ -197,6 +197,7 @@ export interface ApiLlamaCppServerProps {
 	build_info: string;
 	webui_settings?: Record<string, string | number | boolean>;
 	thinking_overrides?: Record<string, number>;
+	preserve_thinking_supported?: boolean;
 }
 
 export interface ApiChatCompletionRequest {

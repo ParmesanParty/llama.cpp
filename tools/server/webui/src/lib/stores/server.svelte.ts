@@ -58,6 +58,10 @@ class ServerStore {
 		return this.props?.thinking_overrides ?? null;
 	}
 
+	get preserveThinkingSupported(): boolean {
+		return Boolean(this.props?.preserve_thinking_supported);
+	}
+
 	get isRouterMode(): boolean {
 		return this.role === ServerRole.ROUTER;
 	}
@@ -161,3 +165,4 @@ export const contextSize = () => serverStore.contextSize;
 export const isRouterMode = () => serverStore.isRouterMode;
 export const isModelMode = () => serverStore.isModelMode;
 export const thinkingOverrides = () => serverStore.thinkingOverrides;
+export const preserveThinkingSupported = () => serverStore.preserveThinkingSupported;

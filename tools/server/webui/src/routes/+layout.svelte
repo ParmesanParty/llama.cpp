@@ -146,6 +146,21 @@
 		}
 	});
 
+	// Apply preserve-thinking default once server props are known.
+	// clearActiveConversation() runs on the index route's onMount before /props
+	// has resolved, so the initial default would otherwise be `false`. Re-apply
+	// when the supported flag changes — only while no chat is active so we
+	// don't clobber a loaded conversation's stored value.
+	$effect(() => {
+		const supported = serverStore.preserveThinkingSupported;
+		untrack(() => {
+			if (!conversationsStore.activeConversation) {
+				conversationsStore.activePreserveThinking = supported;
+			}
+		});
+	});
+
+
 	// Sync settings when server props are loaded
 	$effect(() => {
 		const serverProps = serverStore.props;
