@@ -1151,6 +1151,13 @@ json oaicompat_chat_params_parse(
         inputs.chat_template_kwargs[item.key()] = item.value().dump();
     }
 
+    // Accept preserve_thinking as a top-level boolean (e.g. from web UI).
+    // chat_template_kwargs.preserve_thinking (from the merge above) takes precedence.
+    if (body.contains("preserve_thinking") && body.at("preserve_thinking").is_boolean()
+        && !inputs.chat_template_kwargs.count("preserve_thinking")) {
+        inputs.chat_template_kwargs["preserve_thinking"] = body.at("preserve_thinking").get<bool>() ? "true" : "false";
+    }
+
     // parse the "enable_thinking" kwarg to override the default value
     auto enable_thinking_kwarg = json_value(inputs.chat_template_kwargs, "enable_thinking", std::string(""));
     if (enable_thinking_kwarg == "true") {
