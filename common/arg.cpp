@@ -2354,6 +2354,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_GPU_LAYERS"));
     add_opt(common_arg(
+        {"--moe-hot-k"}, "N",
+        "MoE hot expert cache: experts per layer to keep in GPU (0 = disabled)",
+        [](common_params & params, int value) {
+            params.moe_hot_k = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_HOT_K"));
+    add_opt(common_arg(
+        {"--moe-hot-rebalance-interval"}, "N",
+        "MoE hot cache: tokens between rebalance events (default 40)",
+        [](common_params & params, int value) {
+            params.moe_hot_rebalance_interval = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_HOT_REBALANCE_INTERVAL"));
+    add_opt(common_arg(
         {"-sm", "--split-mode"}, "{none,layer,row,tensor}",
         "how to split the model across multiple GPUs, one of:\n"
         "- none: use one GPU only\n"

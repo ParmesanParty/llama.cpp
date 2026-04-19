@@ -11,6 +11,11 @@
 #include "llama-ext.h"
 #include "llama.h"
 
+#ifdef GGML_USE_CUDA
+#include <cuda_runtime.h>
+#include "ggml-cuda.h"
+#endif
+
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -164,6 +169,9 @@ llama_context::llama_context(
 
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
+
+    cparams.moe_hot_k                  = params.moe_hot_k;
+    cparams.moe_hot_rebalance_interval = params.moe_hot_rebalance_interval;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -364,6 +372,97 @@ llama_context::llama_context(
             sampling.token_ids_full_vocab[i] = i;
         }
     }
+
+    // Initialize MoE hot expert cache if enabled (parmesan branch).
+    //
+    // Two preconditions are checked here BEFORE calling the init function so
+    // we can fail fast with a clear, actionable warning. The init function
+    // itself has belt-and-suspenders refusals (see Phase 4.5 review fixes:
+    // I2 catches all-pinning-failed via cudaHostRegister, the K guard
+    // catches positive-K-but-disabled), but those are downstream of the two
+    // operator-facing failure modes — LoRA mixing and missing CPU offload —
+    // which deserve a specific message at the source.
+    if (cparams.moe_hot_k > 0) {
+        // Sanity check 1: LoRA incompatibility (Decision #24).
+        //
+        // build_lora_mm_id (src/llama-graph.cpp) returns the raw
+        // ggml_mul_mat_id node ONLY when no active LoRA has a weight for the
+        // input tensor. With any active LoRA weight, it wraps via
+        // `res = ggml_add(ctx0, res, ab_cur);` and returns a GGML_OP_ADD.
+        // The dual-path code in Tasks 7.1b/7.1c writes the sentinel flag
+        // into op_params[0] expecting to reach the MUL_MAT_ID op_params;
+        // with LoRA active it would silently write the flag onto the ADD op
+        // instead, the underlying MUL_MAT_ID would never see the opt-in,
+        // and the CPU kernel would crash on the first -1 sentinel id.
+        // Refuse at init time so we fail loud (log warning, leave
+        // moe_hot_cache == nullptr) rather than crashing mid-decode.
+        const bool lora_blocked = (loras && !loras->empty());
+        if (lora_blocked) {
+            LLAMA_LOG_WARN(
+                "%s: LLAMA_ARG_MOE_HOT_K=%u incompatible with active LoRA adapters "
+                "(build_lora_mm_id wraps MUL_MAT_ID in ggml_add when a LoRA weight "
+                "matches an expert tensor, which would break the sentinel-skip "
+                "opt-in mechanism). Hot cache disabled. Detach LoRAs to use the "
+                "hot cache.\n",
+                __func__, cparams.moe_hot_k);
+        } else {
+            // Sanity check 2: expert tensors must be on the CPU backend to benefit.
+            //
+            // We inspect only the first MoE layer and `break` after its backend
+            // check. This is intentional and relies on a uniformity assumption:
+            // all MoE layers share the same backend buffer type, because
+            // `-ot exps=CPU` (or equivalent) applies a single regex across every
+            // matching tensor at load time. Every upstream MoE model we care
+            // about (qwen35moe, qwen3moe, mixtral, deepseek, llama4) has a
+            // single MoE tensor group configured uniformly. If a future mixed
+            // configuration lands — e.g. per-layer tensor overrides that place
+            // some layers' experts on GPU and others on CPU — this check will
+            // silently mis-classify. When that happens, lift the `break` and
+            // require ALL MoE layers to report CPU residency before enabling.
+            bool experts_on_cpu = false;
+            bool found_moe_layer = false;
+            for (const auto & layer : model.layers) {
+                auto * exp = layer.ffn_gate_up_exps ? layer.ffn_gate_up_exps : layer.ffn_gate_exps;
+                if (exp != nullptr) {
+                    found_moe_layer = true;
+                    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(exp->buffer);
+                    if (ggml_backend_buft_is_host(buft) ||
+                        buft == ggml_backend_cpu_buffer_type()) {
+                        experts_on_cpu = true;
+                    }
+                    break;  // only first MoE layer inspected (uniformity assumption above)
+                }
+            }
+
+            if (!found_moe_layer) {
+                LLAMA_LOG_WARN(
+                    "%s: LLAMA_ARG_MOE_HOT_K=%u but model has no MoE layers. "
+                    "Hot cache disabled.\n",
+                    __func__, cparams.moe_hot_k);
+            } else if (!experts_on_cpu) {
+                LLAMA_LOG_WARN(
+                    "%s: LLAMA_ARG_MOE_HOT_K=%u but expert tensors are not on CPU backend. "
+                    "Hot cache disabled — feature only helps when experts are offloaded to CPU "
+                    "(e.g., with -ot exps=CPU)\n",
+                    __func__, cparams.moe_hot_k);
+            } else {
+                moe_hot_cache = llama_moe_hot_cache_init(
+                    this,
+                    (int) cparams.moe_hot_k,
+                    (int) cparams.moe_hot_rebalance_interval);
+                if (moe_hot_cache == nullptr) {
+                    // init logged its own ERROR (one of: invalid K, null ctx,
+                    // n_expert==0, no merged ffn_gate_up_exps, no MoE layers,
+                    // VRAM allocation failed, all-pinning-failed). The WARN
+                    // here is the context-level summary that ties the failure
+                    // to the operator's intent.
+                    LLAMA_LOG_WARN("%s: failed to initialize MoE hot cache\n", __func__);
+                } else {
+                    LLAMA_LOG_INFO("%s: MoE hot cache attached to llama_context\n", __func__);
+                }
+            }
+        }
+    }
 }
 
 llama_context::~llama_context() {
@@ -383,6 +482,16 @@ llama_context::~llama_context() {
             }
         }
     }
+    // Free the MoE hot expert cache (parmesan branch). Must precede backend
+    // teardown because the cache holds a backend buffer + a copy stream + an
+    // event + cudaHostRegister'd model weight regions; its free() function
+    // synchronizes the copy stream and unregisters the host pointers before
+    // freeing the backend buffer. Calling this AFTER backend destruction
+    // would synchronize on a destroyed stream and try to free a buffer
+    // whose backend handle is gone. ggml_opt_free is unrelated and runs
+    // last per upstream convention.
+    llama_moe_hot_cache_free(moe_hot_cache);
+    moe_hot_cache = nullptr;
     ggml_opt_free(opt_ctx);
 }
 
@@ -669,6 +778,14 @@ const llama_model & llama_context::get_model() const {
 
 const llama_cparams & llama_context::get_cparams() const {
     return cparams;
+}
+
+const std::vector<ggml_backend_t> & llama_context::get_backend_ptrs() const {
+    return backend_ptrs;
+}
+
+const llm_graph_result_ptr & llama_context::get_gf_res_prev() const {
+    return gf_res_prev;
 }
 
 ggml_backend_sched_t llama_context::get_sched() const {
@@ -1669,6 +1786,34 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     int64_t n_outputs_prev = 0;
 
+#ifdef GGML_USE_CUDA
+    // MoE hot cache: if a prior post_decode scheduled async weight transfers
+    // on the copy stream, make the CUDA compute stream wait on the recorded
+    // rebalance event before executing any ubatch graph. This pairs with the
+    // cudaEventRecord at the tail of llama_moe_hot_cache_post_decode.
+    //
+    // Today (Phase 9) promote_layer drains the copy stream per-tensor via
+    // cudaStreamSynchronize, so by the time we reach here the event is
+    // effectively already signaled and the wait is a no-op. Phase 10's
+    // STEADY rebalance will issue true async copies that outlive the hook,
+    // and this wait is what keeps the compute stream from reading half-
+    // written hot slots. Wiring it now keeps Phase 9 and Phase 10 parallel.
+    if (moe_hot_cache != nullptr && moe_hot_cache->rebalance_event != nullptr) {
+        for (ggml_backend_t backend : backend_ptrs) {
+            if (ggml_backend_is_cuda(backend)) {
+                cudaStream_t main_stream =
+                    (cudaStream_t) ggml_backend_cuda_get_stream(backend);
+                if (main_stream != nullptr) {
+                    cudaStreamWaitEvent(
+                        main_stream,
+                        (cudaEvent_t) moe_hot_cache->rebalance_event, 0);
+                }
+                break;
+            }
+        }
+    }
+#endif
+
     do {
         const auto & ubatch = mctx->get_ubatch();
 
@@ -1877,6 +2022,27 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
+
+    // MoE hot cache post-decode hook: accumulates per-layer activation counts for
+    // the tumbling window (Decision #27) and, once Phase 9/10 land, drives FILLING
+    // promotions and STEADY rebalance deltas. Called exactly once per successful
+    // decode; the cache is a no-op when disabled or in LLAMA_MOE_HOT_CACHE_DISABLED.
+    //
+    // Multi-ubatch caveat (Phase 9 TODO): this hook sits OUTSIDE the
+    // `do { } while (mctx->next())` ubatch loop above, so when an input
+    // llama_batch has n_tokens > n_ubatch, the loop runs multiple iterations
+    // but the hook only fires once at the end. The `gf_res_prev` / `res` graph
+    // output tensors (including ffn_moe_topk for MoE models) only hold the
+    // LAST ubatch's data when we arrive here — earlier ubatches have been
+    // overwritten. For Phase 9's window_counts accumulator, this means a
+    // prefill batch that spans multiple ubatches will only contribute its
+    // final ubatch's activation data to the tumbling window. Phase 9 must
+    // either push accumulation into the ubatch loop above or WARN and skip
+    // multi-ubatch decode calls. For Qwen3.5-122B-A10B production (n_tokens
+    // always == 1 in autoregressive decode), this gap is never triggered.
+    if (moe_hot_cache != nullptr) {
+        llama_moe_hot_cache_post_decode(moe_hot_cache, this);
+    }
 
     return 0;
 }
@@ -2161,8 +2327,9 @@ llm_graph_params llama_context::graph_params(
         /*.cvec        =*/ cvec.get(),
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
-        /*.cross       =*/ &cross,
-        /*.samplers    =*/ sampling.samplers,
+        /*.cross         =*/ &cross,
+        /*.moe_hot_cache =*/ moe_hot_cache,
+        /*.samplers      =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
@@ -2916,6 +3083,8 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.moe_hot_k                   =*/ 0,
+        /*.moe_hot_rebalance_interval  =*/ 40,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
     };

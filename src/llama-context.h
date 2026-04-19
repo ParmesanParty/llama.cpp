@@ -6,6 +6,7 @@
 #include "llama-graph.h"
 #include "llama-adapter.h"
 #include "llama-impl.h"
+#include "llama-moe-hot-cache.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -43,6 +44,21 @@ struct llama_context {
 
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
+
+    // Access the backend handle list (raw ggml_backend_t pointers). Used by the
+    // MoE hot expert cache (src/llama-moe-hot-cache.cpp) to locate the CUDA
+    // backend for VRAM allocation. Prefer this over the unique-ptr-wrapped
+    // `backends` vector — see decision #6 in the hot cache plan.
+    const std::vector<ggml_backend_t> & get_backend_ptrs() const;
+
+    // Access the last completed graph result. Used by the MoE hot cache
+    // post-decode hook (src/llama-moe-hot-cache.cpp) to read the
+    // "ffn_moe_topk-<il>" tensors that were materialized during the just-
+    // finished decode. The pointer is nullptr before the first decode and
+    // holds the last decode's graph result afterwards. Added in Phase 9
+    // following the Decision #29 accessor pattern — `gf_res_prev` itself is
+    // private.
+    const llm_graph_result_ptr & get_gf_res_prev() const;
 
     ggml_backend_sched_t get_sched() const;
 
@@ -332,6 +348,21 @@ private:
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
+
+    // MoE hot expert cache (parmesan branch). Initialized in the constructor
+    // when cparams.moe_hot_k > 0 AND the LoRA + CPU-residency sanity checks
+    // pass; freed in the destructor before ggml_opt_free. nullptr means the
+    // cache is disabled and the dual-path graph builder will fall back to
+    // the single-path code on every layer accessor lookup.
+    //
+    // Lifecycle invariant (load-bearing for llm_graph_params::allow_reuse):
+    // this pointer is set exactly once in the constructor and cleared exactly
+    // once in the destructor. Never toggled or swapped mid-session — graph
+    // reuse compares ubatch/n_outputs/samplers but NOT moe_hot_cache, so a
+    // reused graph carries stale-but-still-valid tensor references to the
+    // cache's hot_map/cold_map tensors whose device data is updated between
+    // decodes via async copies. See plan Decision #28.
+    struct llama_moe_hot_cache * moe_hot_cache = nullptr;
 
     // perf
     mutable int64_t t_start_us  = 0;
