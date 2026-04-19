@@ -18,6 +18,7 @@ struct ggml_tensor;
 
 struct llama_cparams;
 struct llama_layer;
+struct llama_moe_hot_cache;
 
 struct llama_memory_context_i;
 
@@ -545,6 +546,8 @@ struct llm_graph_params {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
+    const llama_moe_hot_cache    * moe_hot_cache;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     static bool samplers_equal(
@@ -631,6 +634,13 @@ struct llm_graph_params {
             cvec  == other.cvec  &&
             loras == other.loras &&
             cross == other.cross;
+        // Note: moe_hot_cache is deliberately NOT compared here. Per Decision
+        // #28, the cache pointer is const-after-construction (set once in
+        // llama_context::llama_context, cleared once in the destructor) and a
+        // reused graph carries stable tensor references to the cache's
+        // hot_map / cold_map tensors whose device data is updated between
+        // decodes via async copies. Comparing the pointer would be correct
+        // but redundant.
     }
 };
 
@@ -759,6 +769,8 @@ struct llm_graph_context {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
+    const llama_moe_hot_cache    * moe_hot_cache;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     const llm_graph_cb & cb_func;
@@ -846,7 +858,8 @@ struct llm_graph_context {
              ggml_tensor * gate_up_exps = nullptr,
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
-             ggml_tensor * down_exps_s = nullptr) const;
+             ggml_tensor * down_exps_s = nullptr,
+    const llama_moe_hot_cache * hot_cache = nullptr) const;
 
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
@@ -871,7 +884,8 @@ struct llm_graph_context {
              ggml_tensor * gate_up_exps_b = nullptr,
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
-             ggml_tensor * down_exps_s = nullptr) const;
+             ggml_tensor * down_exps_s = nullptr,
+    const llama_moe_hot_cache * hot_cache = nullptr) const;
 
     //
     // inputs
