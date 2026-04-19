@@ -36,6 +36,8 @@ export interface SettingsChatServiceOptions {
 	tools?: OpenAIToolDefinition[];
 	// Enable extended thinking
 	enableThinking?: boolean;
+	// Preserve prior-turn reasoning content in the serialized prompt (Qwen3.6+)
+	preserveThinking?: boolean;
 	// Generation parameters
 	temperature?: number;
 	max_tokens?: number;
