@@ -1366,7 +1366,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) {
             params.system_prompt = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_DIFFUSION, LLAMA_EXAMPLE_MTMD}));
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_DIFFUSION, LLAMA_EXAMPLE_MTMD, LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--perf"},
         {"--no-perf"},
@@ -1404,8 +1404,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             if (!params.system_prompt.empty() && params.system_prompt.back() == '\n') {
                 params.system_prompt.pop_back();
             }
+            params.system_prompt_file = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_DIFFUSION}));
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_DIFFUSION, LLAMA_EXAMPLE_SERVER})
+     .set_env("LLAMA_ARG_SYSTEM_PROMPT_FILE"));
     add_opt(common_arg(
         {"--in-file"}, "FNAME",
         "an input file (use comma-separated values to specify multiple files)",

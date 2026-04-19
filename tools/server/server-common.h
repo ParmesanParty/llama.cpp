@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 #include <cinttypes>
+#include <mutex>
 
 using json = nlohmann::ordered_json;
 
@@ -296,6 +297,9 @@ struct server_chat_params {
     std::string reasoning_budget_message;
     std::string media_path;
     bool force_pure_content = false;
+    mutable std::string system_prompt;
+    std::string system_prompt_path;
+    mutable std::time_t system_prompt_mtime = 0;
 };
 
 // used by /completions endpoint

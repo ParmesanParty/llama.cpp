@@ -1065,7 +1065,10 @@ private:
                 /* reasoning_budget      */ params_base.sampling.reasoning_budget_tokens,
                 /* reasoning_budget_msg  */ params_base.sampling.reasoning_budget_message,
                 /* media_path            */ params_base.media_path,
-                /* force_pure_content    */ params_base.force_pure_content_parser
+                /* force_pure_content    */ params_base.force_pure_content_parser,
+                /* system_prompt         */ params_base.system_prompt,
+                /* system_prompt_path    */ params_base.system_prompt_file,
+                /* system_prompt_mtime   */ 0,
             };
         }
 
