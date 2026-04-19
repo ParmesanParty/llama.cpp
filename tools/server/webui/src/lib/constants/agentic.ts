@@ -44,6 +44,21 @@ export const LEGACY_REASONING_TAGS = {
 
 export const RETRACTION_TAG = '<<<RETRACTED_START>>>';
 
+/**
+ * Delimiter inserted between reasoning blocks from different tool iterations.
+ * Allows the renderer to split a single reasoningContent string into per-iteration
+ * blocks and display them inline within the tool timeline.
+ */
+export const REASONING_BOUNDARY = '\n<<<reasoning_boundary>>>\n';
+
+/**
+ * Stream feature tokens for the X-Stream-Features header.
+ * Opts the client into typed SSE events from the proxy orchestrator.
+ */
+export const STREAM_FEATURE_TOKENS = [
+	'tool-status', 'retraction', 'compaction', 'sources', 'tool-health'
+] as const;
+
 // Regex for trimming leading/trailing newlines
 export const TRIM_NEWLINES_REGEX = /^\n+|\n+$/g;
 

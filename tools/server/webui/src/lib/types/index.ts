@@ -21,6 +21,10 @@ export type {
 	ApiChatCompletionStreamChunk,
 	ApiChatCompletionResponse,
 	ApiCompactionMetadata,
+	ApiToolStatusEvent,
+	ApiRetractionEvent,
+	ApiSourcesEvent,
+	ApiToolHealthEvent,
 	ApiSlotData,
 	ApiProcessingState,
 	ApiRouterModelMeta,
@@ -66,6 +70,7 @@ export type {
 	DatabaseMessageExtraTextFile,
 	DatabaseMessageExtra,
 	DatabaseMessage,
+	StreamEvent,
 	ExportedConversation,
 	ExportedConversations
 } from './database';
