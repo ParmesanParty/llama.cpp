@@ -1,6 +1,13 @@
 import type { ErrorDialogType } from '$lib/enums';
 import type { ApiChatCompletionToolCall } from './api';
 import type { DatabaseMessage, DatabaseMessageExtra } from './database';
+import type {
+	ApiCompactionMetadata,
+	ApiToolStatusEvent,
+	ApiRetractionEvent,
+	ApiSourcesEvent,
+	ApiToolHealthEvent
+} from './api';
 
 export interface ChatUploadedFile {
 	id: string;
@@ -113,6 +120,11 @@ export interface ChatStreamCallbacks {
 	onFlowComplete?: (timings?: ChatMessageTimings) => void;
 	onError?: (error: Error) => void;
 	onTurnComplete?: (intermediateTimings: ChatMessageTimings) => void;
+	onCompaction?: (metadata: ApiCompactionMetadata) => void;
+	onToolStatus?: (event: ApiToolStatusEvent) => void;
+	onRetraction?: (event: ApiRetractionEvent) => void;
+	onSources?: (event: ApiSourcesEvent) => void;
+	onToolHealth?: (event: ApiToolHealthEvent) => void;
 }
 
 /**
@@ -158,4 +170,30 @@ export interface AttachmentDisplayItemsOptions {
 export interface FileProcessingResult {
 	extras: DatabaseMessageExtra[];
 	emptyFiles: string[];
+}
+
+/**
+ * Shared types for stream event rendering (tool timeline, sources, citations).
+ * Used by ChatMessageStreamContent, ToolTimeline, SourcesFooter, resolve-citations.
+ */
+
+export interface SourceItem {
+	index: number;
+	/** Original global source index for [N] citation mapping (before re-densification). */
+	cite_index?: number;
+	title: string;
+	url: string;
+}
+
+export interface ToolChip {
+	tool: string;
+	status: string;
+	query?: string;
+	call_id?: string;
+}
+
+export interface ToolStep {
+	reasoning?: string;
+	reasoningPending?: boolean;
+	tools: ToolChip[];
 }

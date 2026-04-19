@@ -257,6 +257,43 @@ export interface ApiChatCompletionToolCall extends ApiChatCompletionToolCallDelt
 	function?: ApiChatCompletionToolCallFunctionDelta & { arguments?: string };
 }
 
+export interface ApiCompactionMetadata {
+	summary: string;
+	compacted_message_count: number;
+	compacted_up_to_index: number;
+}
+
+// Typed SSE event payloads (from X-Stream-Features negotiation)
+
+export interface ApiToolStatusEvent {
+	tool: string;
+	status: 'executing' | 'completed' | 'failed' | 'skipped';
+	iteration: number;
+	call_id?: string;
+	query?: string;
+	duration_ms?: number;
+	error?: string;
+}
+
+export interface ApiRetractionEvent {
+	reason: string;
+	message: string;
+}
+
+export interface ApiSourcesEvent {
+	sources: Array<{
+		index: number;
+		title: string;
+		url: string;
+	}>;
+}
+
+export interface ApiToolHealthEvent {
+	tool: string;
+	state: string;
+	reason: string;
+}
+
 export interface ApiChatCompletionStreamChunk {
 	object?: string;
 	model?: string;

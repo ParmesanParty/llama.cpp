@@ -87,6 +87,12 @@ export type DatabaseMessageExtra =
 	| DatabaseMessageExtraMcpResource
 	| DatabaseMessageExtraLegacyContext;
 
+export interface StreamEvent {
+	type: 'tool_status' | 'retraction' | 'sources' | 'tool_health' | 'compaction';
+	offset: number;
+	data: Record<string, unknown>;
+}
+
 export interface DatabaseMessage {
 	id: string;
 	convId: string;
@@ -109,6 +115,7 @@ export interface DatabaseMessage {
 	extra?: DatabaseMessageExtra[];
 	timings?: ChatMessageTimings;
 	model?: string;
+	streamEvents?: StreamEvent[];
 }
 
 export type ExportedConversation = {
