@@ -127,6 +127,14 @@ extern "C" {
     GGML_API void                 ggml_backend_event_synchronize(ggml_backend_event_t event);
     GGML_API void                 ggml_backend_event_wait(ggml_backend_t backend, ggml_backend_event_t event);
 
+    // Wait for any pending async cross-backend copies whose destination is
+    // input_cpy. Walks the given backend's iface; if backend has a
+    // wait_input_ready impl, calls it. No-op otherwise. Used by the
+    // scheduler to drain async D2H copies (issued by CUDA's
+    // cpy_tensor_async fast path) before the consuming split's compute_async
+    // reads the data.
+    GGML_API void                 ggml_backend_wait_input_ready(ggml_backend_t backend, struct ggml_tensor * input_cpy);
+
     //
     // Backend device
     //
@@ -327,13 +335,6 @@ extern "C" {
     // Get the number of splits of the last graph
     GGML_API int                  ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched);
     GGML_API int                  ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched);
-
-    // Expert frequency tracking (MoE telemetry)
-    // Returns pointer to internal frequency array, or NULL if no data.
-    // Layout: flat array of n_layers * max_experts_stride floats (stride returned via parameter).
-    // Caller must not free. Values are EMA frequencies in [0, 1].
-    GGML_API const float * ggml_backend_sched_get_expert_freq(ggml_backend_sched_t sched, int * n_layers, int * n_experts, uint64_t * n_tokens, int * stride, float * decay);
-    GGML_API void          ggml_backend_sched_reset_expert_freq(ggml_backend_sched_t sched);
 
     GGML_API ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched_t sched, ggml_backend_t backend);
     GGML_API size_t                     ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend);

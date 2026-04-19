@@ -727,6 +727,7 @@ static ggml_backend_i ggml_backend_rpc_interface = {
     /* .graph_compute           = */ ggml_backend_rpc_graph_compute,
     /* .event_record            = */ NULL,
     /* .event_wait              = */ NULL,
+    /* .wait_input_ready        = */ NULL,
     /* .graph_optimize          = */ NULL,
 };
 

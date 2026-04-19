@@ -44,6 +44,15 @@ static __global__ void mm_ids_helper(
             int iex_used = -1; // The index at which the expert is used, if any.
             for (int iex = threadIdx.x; iex < n_expert_used; iex += warp_size) {
                 const int expert_used = ids[it*si1 + iex];
+                // Negative ids are sentinels: skip this slot entirely. The
+                // MoE hot expert cache masks out-of-bucket experts with -1,
+                // and the dst zero-init in ggml_cuda_mul_mat_id leaves the
+                // corresponding output rows at zero. The branch is
+                // unconditional rather than flag-gated because it is a
+                // single cheap per-thread compare, and sentinel-skip is a
+                // strict superset of the original semantics (non-sentinel
+                // callers never produce negative ids).
+                if (expert_used < 0) continue;
                 nex_prev += expert_used < expert;
                 if (expert_used == expert) {
                     iex_used = iex;
@@ -66,8 +75,14 @@ static __global__ void mm_ids_helper(
             const int it = it0 + threadIdx.x / neu_padded;
 
             const int iex = threadIdx.x % neu_padded; // The index at which the expert is used, if any.
-            const int expert_used = (neu_padded == n_expert_used || iex < n_expert_used) && it < n_tokens ?
+            int expert_used = (neu_padded == n_expert_used || iex < n_expert_used) && it < n_tokens ?
                 ids[it*si1 + iex] : INT_MAX;
+            // Sentinel-skip: clamp negative ids to INT_MAX so the rest of
+            // this specialized path treats them as "unused slot" — exactly
+            // the same signal used for out-of-range iex reads. Matches the
+            // generic path above; see its comment for rationale. Note the
+            // const removal on expert_used so we can overwrite the read.
+            if (expert_used < 0) expert_used = INT_MAX;
             const int iex_used = expert_used == expert ? iex : -1;
             nex_prev += expert_used < expert;
 

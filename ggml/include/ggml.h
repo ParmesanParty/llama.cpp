@@ -586,6 +586,19 @@ extern "C" {
         GGML_OP_COUNT,
     };
 
+    // op_params[0] bit flags for GGML_OP_MUL_MAT_ID.
+    // Callers that emit a MUL_MAT_ID node whose ids tensor may contain
+    // negative sentinel values (meaning "skip this slot; produce zero output")
+    // must set this bit on the returned node. op_params is a public int32_t
+    // array on ggml_tensor, so external callers can write it directly:
+    //     result->op_params[0] = GGML_MUL_MAT_ID_FLAG_SENTINEL;
+    // Internal callers (ggml.c, llama.cpp core) can equivalently use the
+    // ggml_set_op_params_i32() helper declared in ggml-impl.h.
+    // Kernels honour the flag by zero-initializing dst and skipping negative ids.
+    // Unset (the default) preserves the original assertion-on-negative semantics
+    // and imposes zero per-call overhead.
+    #define GGML_MUL_MAT_ID_FLAG_SENTINEL (1 << 0)
+
     enum ggml_unary_op {
         GGML_UNARY_OP_ABS,
         GGML_UNARY_OP_SGN,
@@ -646,6 +659,7 @@ extern "C" {
         GGML_TENSOR_FLAG_PARAM   =  4, // ...contains trainable parameters
         GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
+        GGML_TENSOR_FLAG_SPLIT_BARRIER = 32, // ...forces a new scheduler split before this node (same-backend splits won't merge across this)
     };
 
     enum ggml_tri_type {

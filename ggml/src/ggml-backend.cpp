@@ -20,12 +20,31 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <vector>
 
 #ifdef __APPLE__
 #include <sys/types.h>
 #include <sys/sysctl.h>
 #endif
+
+// Parmesan: functional kill switch for the Phase 11.5 scheduler-level prefetch.
+// Default: ENABLED. Set LLAMA_MOE_HOT_PREFETCH=0 to disable (safety escape hatch
+// in case prefetch regressions appear in the wild). Env var is read once and
+// cached.
+static inline bool sched_prefetch_enabled() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char * env = getenv("LLAMA_MOE_HOT_PREFETCH");
+        cached = (env != nullptr && strcmp(env, "0") == 0) ? 0 : 1;
+        if (!cached) {
+            GGML_LOG_WARN("WARN sched: LLAMA_MOE_HOT_PREFETCH=0 — "
+                          "Phase 11.5 prefetch DISABLED\n");
+        }
+    }
+    return cached != 0;
+}
 
 
 // backend buffer type
@@ -505,8 +524,27 @@ void ggml_backend_tensor_copy_async(ggml_backend_t backend_src, ggml_backend_t b
     }
 
     GGML_ASSERT(backend_dst);
+    GGML_ASSERT(backend_src);
+
+    // Try the dst-side iface first (existing behavior — covers cases like
+    // cuda→cuda where the dst backend knows the protocol). If that returns
+    // false (or NULL), try the src-side iface — this is the Parmesan path
+    // that covers cases like cuda→pinned-host D2H, where the dst backend
+    // (CPU) has no async knowledge but the src backend (CUDA) does.
+    // Mirrors the scheduler's slow-path dispatch in compute_splits.
+    //
+    // Callers copying CUDA→pinned-host through this wrapper still need to
+    // call ggml_backend_wait_input_ready(backend_src, dst) afterwards to
+    // drain the pending event. The wrapper doesn't drain because draining
+    // is the consumer's responsibility — the wrapper can't know when the
+    // data will be read.
     if (backend_dst->iface.cpy_tensor_async != NULL) {
         if (backend_dst->iface.cpy_tensor_async(backend_src, backend_dst, src, dst)) {
+            return;
+        }
+    }
+    if (backend_src->iface.cpy_tensor_async != NULL) {
+        if (backend_src->iface.cpy_tensor_async(backend_src, backend_dst, src, dst)) {
             return;
         }
     }
@@ -554,6 +592,13 @@ void ggml_backend_event_wait(ggml_backend_t backend, ggml_backend_event_t event)
     GGML_ASSERT(backend->iface.event_wait != NULL);
 
     backend->iface.event_wait(backend, event);
+}
+
+void ggml_backend_wait_input_ready(ggml_backend_t backend, struct ggml_tensor * input_cpy) {
+    GGML_ASSERT(backend);
+    if (backend->iface.wait_input_ready != NULL) {
+        backend->iface.wait_input_ready(backend, input_cpy);
+    }
 }
 
 static void ggml_backend_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
@@ -771,52 +816,6 @@ struct ggml_backend_sched_split {
     struct ggml_cgraph graph;
 };
 
-// Expert frequency tracker: per-layer EMA of expert selection frequency.
-// Used to identify hot experts for GPU compute caching in MoE models.
-#define GGML_EXPERT_FREQ_MAX_LAYERS  128
-#define GGML_EXPERT_FREQ_MAX_EXPERTS 512
-
-struct expert_freq_tracker {
-    float    freq[GGML_EXPERT_FREQ_MAX_LAYERS][GGML_EXPERT_FREQ_MAX_EXPERTS]; // EMA frequencies
-    int      n_layers;   // detected layer count (0 = not yet seen)
-    int      n_experts;  // detected expert count per layer
-    uint64_t n_tokens;   // total tokens tracked
-    float    decay;      // EMA decay factor (e.g. 0.999)
-
-    void init(float decay_factor) {
-        memset(freq, 0, sizeof(freq));
-        n_layers  = 0;
-        n_experts = 0;
-        n_tokens  = 0;
-        decay     = decay_factor;
-    }
-
-    // Called once per layer per token with the set of selected expert IDs.
-    void record(int layer_id, const int32_t * expert_ids, int n_selected, int total_experts) {
-        if (layer_id < 0 || layer_id >= GGML_EXPERT_FREQ_MAX_LAYERS) return;
-        if (total_experts > GGML_EXPERT_FREQ_MAX_EXPERTS) return;
-
-        // update detected dimensions
-        if (layer_id >= n_layers)  n_layers  = layer_id + 1;
-        if (total_experts > n_experts) n_experts = total_experts;
-
-        // decay all experts in this layer
-        float * lf = freq[layer_id];
-        for (int i = 0; i < total_experts; i++) {
-            lf[i] *= decay;
-        }
-
-        // boost selected experts
-        float boost = 1.0f - decay;
-        for (int i = 0; i < n_selected; i++) {
-            int eid = expert_ids[i];
-            if (eid >= 0 && eid < total_experts) {
-                lf[eid] += boost;
-            }
-        }
-    }
-};
-
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
@@ -865,9 +864,6 @@ struct ggml_backend_sched {
     bool op_offload;
 
     int debug;
-
-    // expert frequency tracker — per-layer EMA of expert selection
-    expert_freq_tracker * exp_freq;     // NULL from calloc, lazy-init
 
     // used for debugging graph reallocations [GGML_SCHED_DEBUG_REALLOC]
     // ref: https://github.com/ggml-org/llama.cpp/pull/17617
@@ -1349,6 +1345,19 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 }
             }
 
+            // Parmesan: explicit split barrier — a node flagged with
+            // GGML_TENSOR_FLAG_SPLIT_BARRIER forces a new split even when
+            // the backend matches. Used by the MoE hot cache dual-path to
+            // separate the attention split from the hot-expert split so the
+            // scheduler's prefetch loop can issue a D2H copy for the cold
+            // split's input BETWEEN attention's compute_async and hot's
+            // compute_async. Without this, the scheduler merges
+            // [attention + hot] into one split and the prefetch captures
+            // the wrong event — see the async-cross-backend-copy plan.
+            if ((node->flags & GGML_TENSOR_FLAG_SPLIT_BARRIER) && i > split->i_start) {
+                need_new_split = true;
+            }
+
             if (node_backend_id != cur_backend_id || need_new_split) {
                 split->i_end = i;
                 i_split++;
@@ -1587,6 +1596,101 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+// Parmesan: prefetch the next split's cross-backend input copies BEFORE the
+// current split's compute_async runs. This is the "look-ahead" that lets the
+// CUDA backend's cpy_tensor_async record an event capturing only the
+// PRODUCER's queued work (e.g., attention) and NOT the next sibling compute
+// (e.g., hot). The recorded event is what cudaStreamWaitEvent enforces, and
+// it's snapshotted at call time — so issuing the prefetch here, before the
+// current split's compute_async, is what enables hot's compute to run in
+// parallel with cold's CPU compute.
+//
+// See "Dispatch order analysis" in docs/superpowers/plans/2026-04-11-async-
+// cross-backend-copy.md for the full mechanism trace.
+//
+// Returns nothing — the events are stashed in the source backend's
+// pending_d2h_events map (by destination pointer) for the next split's
+// wait_input_ready drain to consume.
+//
+// Skips inputs that:
+//   - have GGML_TENSOR_FLAG_INPUT (user input — handled by sync path)
+//   - are eligible for the MoE expert weight-offload optimization (handled
+//     by the existing copy_experts path in the inputs loop)
+//   - are same-backend (no copy needed)
+//   - have no input_backend->iface.cpy_tensor_async impl
+//   - have a dst backend with its own cpy_tensor_async impl (the existing
+//     dst-side dispatch handles those — see the bail-out at the top)
+static void ggml_backend_sched_prefetch_next_split_inputs(
+        ggml_backend_sched_t sched,
+        const ggml_backend_sched_split * next_split) {
+    if (next_split == nullptr) {
+        return;
+    }
+    const int next_backend_id = next_split->backend_id;
+    ggml_backend_t next_backend = sched->backends[next_backend_id];
+
+    // Bail out if the destination backend has its own cpy_tensor_async
+    // impl. The existing dst-side dispatch in the next split's inputs loop
+    // will call it directly. Prefetching here would create a redundant
+    // second issue: the existing CUDA→CUDA cpy_tensor_async path uses the
+    // ctx->copy_event field (not pending_d2h_events) and has no idempotency
+    // check, so a duplicate issue would queue a second memcpy and waste an
+    // event. The prefetch is only beneficial when the dst has NO async
+    // impl AND the src does (the cuda→pinned-host D2H case targeted by
+    // this plan).
+    if (next_backend->iface.cpy_tensor_async != NULL) {
+        return;
+    }
+
+    for (int input_id = 0; input_id < next_split->n_inputs; ++input_id) {
+        ggml_tensor * input = next_split->inputs[input_id];
+        // Skip user-provided inputs — those have to be sync-copied immediately
+        // (to prevent the user from overwriting before the copy finishes), so
+        // there's no benefit to prefetching, and they're not on a producer
+        // backend's compute stream anyway.
+        if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+            continue;
+        }
+        // Find the source backend.
+        ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, input);
+        if (input_backend == nullptr || input_backend == next_backend) {
+            continue;  // same backend or unknown — no cross-backend copy needed
+        }
+        // Skip MoE expert offload candidates — those go through the
+        // copy_experts path which has its own async copy mechanism via
+        // ggml_backend_tensor_set_async. Mirroring the gate from the main
+        // inputs loop:
+        ggml_tensor * input_cpy = tensor_copy(input, next_backend_id, sched->cur_copy);
+        if (input_cpy == nullptr) {
+            continue;  // defensive: scheduler hasn't allocated the scratch yet
+        }
+        ggml_tensor * first_node = next_split->graph.n_nodes > 0 ? next_split->graph.nodes[0] : nullptr;
+        if (first_node != nullptr &&
+            ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+            ggml_backend_buffer_is_host(input->buffer) && (
+            (first_node->src[0] == input_cpy && first_node->op == GGML_OP_MUL_MAT_ID)
+            )) {
+            continue;  // handled by copy_experts in the main loop
+        }
+        // Issue the cross-backend async copy. We try src-side only because
+        // we already bailed out (above) if the dst has its own impl. The
+        // CUDA backend's cpy_tensor_async will route to the D2H Case 2
+        // branch and stash the event in pending_d2h_events. The next
+        // split's inputs loop will call cpy_tensor_async again (the
+        // existing slow-path code doesn't track prefetched state); the
+        // idempotency early-return in the D2H branch (Task 6 Step 3)
+        // detects the existing entry and returns true without re-issuing.
+        if (input_backend->iface.cpy_tensor_async != NULL) {
+            input_backend->iface.cpy_tensor_async(input_backend, next_backend, input, input_cpy);
+            // Return value ignored: if the prefetch fails (e.g., the dst
+            // buffer isn't pinned), no entry is added, and the next split's
+            // inputs loop will fall through to its own slow-path sync
+            // fallback. No correctness issue, just no parallelism win for
+            // this input.
+        }
+    }
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1594,14 +1698,38 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
-    bool freq_token_counted = false;
-    std::vector<int32_t> freq_ids;     // reusable buffer for post-compute frequency tracking
-    std::vector<int32_t> freq_selected;
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+
+        // Parmesan: look one split ahead and prefetch any cross-backend
+        // input copies. This is what lets the CUDA hot work run in parallel
+        // with the CPU cold compute that follows it: the prefetched D2H's
+        // cudaEventRecord captures the compute stream's state RIGHT NOW
+        // (BEFORE this split's compute_async is called), so it captures
+        // only the producer's work (e.g., attention) and not the upcoming
+        // sibling compute (e.g., hot). When the cold split's drain via
+        // wait_input_ready blocks on this event, it waits only for
+        // attention to complete — leaving hot free to run in parallel with
+        // the CPU's cold work.
+        //
+        // No-op for splits without a successor or whose successor doesn't
+        // have cross-backend inputs.
+        // Only prefetch when this split was created by a split barrier
+        // (i.e., it's the [hot] split separated from [attention]). Without
+        // the barrier, [attention + hot] are merged and the prefetch would
+        // capture an event with none of the current layer's GPU work,
+        // racing the D2H with attention's write to the scratch buffer.
+        // The barrier flag lives on the split's first node (set in
+        // llama-graph.cpp on the gate MUL_MAT_ID of the hot path).
+        if (sched_prefetch_enabled() &&
+            split_id + 1 < sched->n_splits &&
+            split->graph.n_nodes > 0 &&
+            (split->graph.nodes[0]->flags & GGML_TENSOR_FLAG_SPLIT_BARRIER)) {
+            ggml_backend_sched_prefetch_next_split_inputs(sched, &splits[split_id + 1]);
+        }
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
@@ -1659,12 +1787,25 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         ggml_backend_synchronize(ids_backend);
 
                         // find the used experts
+                        //
+                        // Parmesan (Phase 1 retrofit for sentinel-skip callers):
+                        // the MoE hot cache's dual-path emission produces cold_ids
+                        // tensors with -1 sentinels at slots whose experts were
+                        // promoted to the hot set. Non-sentinel callers never
+                        // produce negative ids (top-k routing always returns
+                        // valid indices), so the `id < 0` branch is dead for
+                        // them and has zero measurable overhead. Positive
+                        // out-of-range ids remain a hard error — if that fires,
+                        // something upstream is corrupted.
                         used_ids.clear();
                         used_ids.resize(ggml_bitset_size(n_expert));
                         for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; i1++) {
                             for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; i0++) {
                                 int32_t id = ids[i1 * ids_tensor->nb[1]/sizeof(int32_t) + i0 * ids_tensor->nb[0]/sizeof(int32_t)];
-                                GGML_ASSERT(id >= 0 && id < n_expert);
+                                if (id < 0) {
+                                    continue;  // sentinel-skip (Phase 1 semantics)
+                                }
+                                GGML_ASSERT(id < n_expert);
                                 ggml_bitset_set(used_ids.data(), id);
                             }
                         }
@@ -1687,33 +1828,75 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             expert_size_copy + padding_end);
                     };
 
+                    // Parmesan: if every slot is a sentinel (all cold experts
+                    // are hot, no expert weights need to be copied), used_ids
+                    // is empty. The Phase 1 kernel-level dst zero-init + early
+                    // return will handle the MUL_MAT_ID itself, so we can just
+                    // skip the copy_experts scan entirely. Without this guard,
+                    // the "find first used id" loop below runs off the end of
+                    // the bitset.
                     int id = 0;
-                    while (!ggml_bitset_get(used_ids.data(), id)) {
+                    while (id < n_expert && !ggml_bitset_get(used_ids.data(), id)) {
                         id++;
                     }
-                    int32_t first_id = id;
-                    int32_t last_id = first_id;
+                    if (id < n_expert) {
+                        int32_t first_id = id;
+                        int32_t last_id = first_id;
 
-                    for (++id; id < n_expert; ++id) {
-                        if (!ggml_bitset_get(used_ids.data(), id)) {
-                            continue;
-                        }
+                        for (++id; id < n_expert; ++id) {
+                            if (!ggml_bitset_get(used_ids.data(), id)) {
+                                continue;
+                            }
 
-                        if (id == last_id + 1) {
+                            if (id == last_id + 1) {
+                                last_id = id;
+                                continue;
+                            }
+
+                            copy_experts(first_id, last_id);
+
+                            first_id = id;
                             last_id = id;
-                            continue;
                         }
-
                         copy_experts(first_id, last_id);
-
-                        first_id = id;
-                        last_id = id;
                     }
-                    copy_experts(first_id, last_id);
                 } else {
-                    // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
-                    // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
-                    if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
+                    // Try cross-backend async copy. The dispatch order is:
+                    //   1. dst-side iface (existing behavior — covers cases like
+                    //      cuda→cuda where the dst backend knows the protocol)
+                    //   2. src-side iface (Parmesan: covers cases like
+                    //      cuda→pinned-host D2H where the dst backend (CPU) has
+                    //      no async knowledge but the src backend (CUDA) does)
+                    //
+                    // If both return false (or are NULL), fall back to the
+                    // existing sync path: drain the source backend, sync the
+                    // destination, copy. Yes, this still happens for non-pinned
+                    // CPU buffers and other backend pairs we haven't taught the
+                    // CUDA backend about.
+                    //
+                    // **Prefetch interaction.** If the scheduler's prefetch
+                    // helper issued a cpy_tensor_async for this input_cpy in
+                    // the previous iteration, the CUDA backend already has a
+                    // pending event for this dst pointer in its
+                    // pending_d2h_events map. The cpy_tensor_async impl's
+                    // idempotency early-return (Task 6 Step 3) detects this
+                    // and returns true immediately WITHOUT issuing a new
+                    // copy. This is critical for correctness — issuing a new
+                    // copy here would record a new event capturing the
+                    // CURRENT compute stream state (which by now includes
+                    // hot, queued in the previous split's compute_async),
+                    // and the outer drain below would then wait for that new
+                    // event, blocking until hot completes and silently
+                    // defeating the prefetch's parallelism. Don't break the
+                    // early-return contract.
+                    bool handled = false;
+                    if (split_backend->iface.cpy_tensor_async) {
+                        handled = split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy);
+                    }
+                    if (!handled && input_backend->iface.cpy_tensor_async) {
+                        handled = input_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy);
+                    }
+                    if (!handled) {
                         ggml_backend_synchronize(input_backend);
                         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
@@ -1724,6 +1907,39 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
                 }
             }
+        }
+
+        // Parmesan: drain any pending async input copies (e.g., the CUDA
+        // backend's CUDA→pinned-host D2H fast path) before this split's
+        // compute reads them. The drain only fires for inputs whose
+        // backend has a wait_input_ready impl (CUDA today; others NULL).
+        //
+        // The pending events come from TWO places:
+        //   1. The prefetch loop in the previous split's iteration (which
+        //      issued cpy_tensor_async for THIS split's cross-backend
+        //      inputs BEFORE the previous split's compute_async). For
+        //      prefetched inputs, the event is recorded with attention-only
+        //      progress, the memcpy has been running in parallel with hot,
+        //      and this drain returns near-instantly because the event has
+        //      typically already signaled.
+        //   2. The inline cpy_tensor_async in the slow path above (for
+        //      inputs that weren't prefetched, e.g., if the prefetch
+        //      helper's gate skipped them). For inline-issued inputs, the
+        //      event was recorded with all-currently-queued progress (which
+        //      includes hot), so this drain blocks for hot+memcpy.
+        //      Sync-equivalent perf — the fallback case.
+        //
+        // We only call wait_input_ready on the INPUT_BACKEND (the source
+        // of the data), not on every backend. The pending event lives in
+        // the source backend's context (it's where the cpy_tensor_async
+        // queued the work). Iterating all backends would be wasteful.
+        for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+            ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
+            if (input_backend == NULL || input_backend == split_backend) {
+                continue;
+            }
+            struct ggml_tensor * input_cpy = tensor_copy(split->inputs[input_id], split_backend_id, sched->cur_copy);
+            ggml_backend_wait_input_ready(input_backend, input_cpy);
         }
 
         if (!sched->callback_eval) {
@@ -1762,57 +1978,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
 
                 j0 = j1;
-            }
-        }
-
-        // expert frequency tracking — post-compute scan for MUL_MAT_ID nodes
-        // runs after graph compute so IDs tensors contain actual routing decisions
-        if (sched->exp_freq != nullptr || split->graph.n_nodes > 0) {
-            ggml_tensor * prev_freq_ids = nullptr;
-            for (int j = 0; j < split->graph.n_nodes; j++) {
-                struct ggml_tensor * node = split->graph.nodes[j];
-                if (node->op != GGML_OP_MUL_MAT_ID) continue;
-
-                struct ggml_tensor * ids_tensor = node->src[2];
-                if (ids_tensor == prev_freq_ids) continue; // same routing for gate_up + down
-                prev_freq_ids = ids_tensor;
-
-                // lazy-init tracker on first MUL_MAT_ID encounter
-                if (sched->exp_freq == nullptr) {
-                    sched->exp_freq = new expert_freq_tracker();
-                    const char * decay_env = getenv("GGML_EXPERT_FREQ_DECAY");
-                    float decay_val = decay_env ? strtof(decay_env, nullptr) : 0.999f;
-                    if (decay_val <= 0.0f || decay_val >= 1.0f) decay_val = 0.999f;
-                    sched->exp_freq->init(decay_val);
-                }
-
-                // read the IDs tensor (small: n_expert_used * n_tokens int32s)
-                const int64_t n_expert = node->src[0]->ne[2]; // weight tensor dim 2
-                freq_ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
-                ggml_backend_synchronize(split_backend);
-                ggml_backend_tensor_get(ids_tensor, freq_ids.data(), 0, ggml_nbytes(ids_tensor));
-
-                // parse layer index from weight tensor name: "blk.%d.ffn_*_exps"
-                int layer_id = -1;
-                sscanf(node->src[0]->name, "blk.%d.", &layer_id);
-                if (layer_id < 0) continue;
-
-                // collect selected expert IDs
-                freq_selected.clear();
-                for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; i1++) {
-                    for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; i0++) {
-                        int32_t id = freq_ids[i1 * ids_tensor->nb[1]/sizeof(int32_t) + i0 * ids_tensor->nb[0]/sizeof(int32_t)];
-                        if (id >= 0 && id < n_expert) {
-                            freq_selected.push_back(id);
-                        }
-                    }
-                }
-
-                sched->exp_freq->record(layer_id, freq_selected.data(), (int)freq_selected.size(), (int)n_expert);
-                if (!freq_token_counted) {
-                    sched->exp_freq->n_tokens++;
-                    freq_token_counted = true;
-                }
             }
         }
 
@@ -1916,7 +2081,6 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched->prev_node_backend_ids);
     free(sched->prev_leaf_backend_ids);
     free(sched->context_buffer);
-    delete sched->exp_freq;
     free(sched->graph.nodes);
     free(sched->graph.leafs);
     free(sched);
@@ -2032,32 +2196,6 @@ int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {
 int ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     return sched->n_copies;
-}
-
-const float * ggml_backend_sched_get_expert_freq(ggml_backend_sched_t sched, int * n_layers, int * n_experts, uint64_t * n_tokens, int * stride, float * decay) {
-    GGML_ASSERT(sched);
-    if (sched->exp_freq == nullptr || sched->exp_freq->n_layers == 0) {
-        if (n_layers)  *n_layers  = 0;
-        if (n_experts) *n_experts = 0;
-        if (n_tokens)  *n_tokens  = 0;
-        if (stride)    *stride    = 0;
-        if (decay)     *decay     = 0.0f;
-        return nullptr;
-    }
-    if (n_layers)  *n_layers  = sched->exp_freq->n_layers;
-    if (n_experts) *n_experts = sched->exp_freq->n_experts;
-    if (n_tokens)  *n_tokens  = sched->exp_freq->n_tokens;
-    if (stride)    *stride    = GGML_EXPERT_FREQ_MAX_EXPERTS;
-    if (decay)     *decay     = sched->exp_freq->decay;
-    return &sched->exp_freq->freq[0][0];
-}
-
-void ggml_backend_sched_reset_expert_freq(ggml_backend_sched_t sched) {
-    GGML_ASSERT(sched);
-    if (sched->exp_freq != nullptr) {
-        float decay = sched->exp_freq->decay;
-        sched->exp_freq->init(decay);
-    }
 }
 
 int ggml_backend_sched_get_n_backends(ggml_backend_sched_t sched) {

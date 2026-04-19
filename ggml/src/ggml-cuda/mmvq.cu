@@ -422,8 +422,22 @@ static __global__ void mul_mat_vec_q(
     uint32_t channel_y;
     uint32_t sample_dst;
 
-    channel_x  = ncols_dst == 1 && ids ? ids[channel_dst]                     : fastdiv(channel_dst, channel_ratio);
-    channel_y  = ncols_dst == 1 && ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
+    // Sentinel-skip: if ids[channel_dst] is negative, the slot is masked.
+    // dst is already zero-inited in ggml_cuda_mul_mat_id when the caller
+    // opts into GGML_MUL_MAT_ID_FLAG_SENTINEL, so returning early leaves
+    // it at zero. This path is taken for the single-token ncols_dst==1
+    // decode case (the hot expert cache's primary use case).
+    if (ncols_dst == 1 && ids) {
+        const int32_t id_val = ids[channel_dst];
+        if (id_val < 0) {
+            return;
+        }
+        channel_x = id_val;
+        channel_y = fastmodulo(channel_dst, nchannels_y);
+    } else {
+        channel_x = fastdiv(channel_dst, channel_ratio);
+        channel_y = channel_dst;
+    }
     sample_dst = blockIdx.z;
 
     const uint32_t sample_x    = fastdiv(sample_dst, sample_ratio);
@@ -625,7 +639,16 @@ static __global__ void mul_mat_vec_q_moe(
         return;
     }
 
-    const uint32_t channel_x = ids[channel_dst + token_idx * ids_stride];
+    // Sentinel-skip: negative ids mean "skip this slot; produce zero output".
+    // dst is already zero-inited in ggml_cuda_mul_mat_id when the caller opts
+    // into GGML_MUL_MAT_ID_FLAG_SENTINEL, so returning early leaves the slot
+    // at zero. Non-sentinel callers never feed negatives here, so the branch
+    // is effectively free for them.
+    const int32_t channel_x_raw = ids[channel_dst + token_idx * ids_stride];
+    if (channel_x_raw < 0) {
+        return;
+    }
+    const uint32_t channel_x = channel_x_raw;
     const uint32_t channel_y = fastmodulo(channel_dst, nchannels_y);
 
     const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;
