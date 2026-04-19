@@ -1043,6 +1043,11 @@ json oaicompat_chat_params_parse(
         inputs.reasoning_format = common_reasoning_format_from_name(body.at("reasoning_format").get<std::string>());
     }
     inputs.enable_thinking       = opt.enable_thinking;
+    // Accept enable_thinking as a top-level boolean (e.g. from web UI)
+    // chat_template_kwargs.enable_thinking still takes precedence below
+    if (body.contains("enable_thinking") && body.at("enable_thinking").is_boolean()) {
+        inputs.enable_thinking = body.at("enable_thinking").get<bool>();
+    }
     if (!inputs.tools.empty() && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
         if (body.contains("grammar")) {
             throw std::invalid_argument("Cannot use custom grammar constraints with tools.");
