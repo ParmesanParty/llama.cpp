@@ -1,6 +1,7 @@
 import { ServerModelStatus } from '$lib/enums';
 import { apiFetch, apiPost } from '$lib/utils';
 import type { ParsedModelId } from '$lib/types/models';
+import type { PresetManifest, SwitchModelResponse } from '$lib/types/api';
 import {
 	MODEL_QUANTIZATION_SEGMENT_RE,
 	MODEL_CUSTOM_QUANTIZATION_PREFIX_RE,
@@ -80,6 +81,25 @@ export class ModelsService {
 	 */
 	static async unload(modelId: string): Promise<ApiRouterModelsUnloadResponse> {
 		return apiPost<ApiRouterModelsUnloadResponse>(API_MODELS.UNLOAD, { model: modelId });
+	}
+
+	/**
+	 * Fetch preset manifest from proxy (switchable mode).
+	 * Returns null if endpoint not available (404 or error).
+	 */
+	static async listPresets(): Promise<PresetManifest | null> {
+		try {
+			return await apiFetch<PresetManifest>('/api/models');
+		} catch {
+			return null;
+		}
+	}
+
+	/**
+	 * Switch to a different model preset (switchable mode).
+	 */
+	static async switchModel(preset: string): Promise<SwitchModelResponse> {
+		return apiPost<SwitchModelResponse>('/api/models/switch', { model: preset });
 	}
 
 	/**
