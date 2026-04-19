@@ -2,6 +2,7 @@ import { SvelteMap, SvelteSet } from 'svelte/reactivity';
 import { toast } from 'svelte-sonner';
 import { ServerModelStatus, ModelModality } from '$lib/enums';
 import { ModelsService, PropsService } from '$lib/services';
+import type { PresetInfo } from '$lib/types/api';
 import { serverStore } from '$lib/stores/server.svelte';
 import { TTLCache } from '$lib/utils';
 import {
@@ -59,6 +60,13 @@ class ModelsStore {
 
 	favoriteModelIds = $state<Set<string>>(this.loadFavoritesFromStorage());
 
+	// ── Switchable mode (proxy-managed presets) ──────────────────────────
+	presets = $state<Record<string, PresetInfo>>({});
+	switching = $state(false);
+	switchError = $state<string | null>(null);
+	private _isSwitchable = $state(false);
+	private _activePreset = $state<string | null>(null);
+
 	/**
 	 * Model-specific props cache with TTL
 	 * Key: modelId, Value: props data including modalities
@@ -102,6 +110,19 @@ class ModelsStore {
 		return Array.from(this.modelLoadingStates.entries())
 			.filter(([, loading]) => loading)
 			.map(([id]) => id);
+	}
+
+	get isSwitchable(): boolean {
+		return this._isSwitchable;
+	}
+
+	get activePreset(): string | null {
+		return this._activePreset;
+	}
+
+	get activePresetInfo(): PresetInfo | null {
+		if (!this._activePreset) return null;
+		return this.presets[this._activePreset] ?? null;
 	}
 
 	/**
@@ -671,6 +692,77 @@ class ModelsStore {
 	/**
 	 *
 	 *
+	 * Switchable Mode (proxy-managed presets)
+	 *
+	 *
+	 */
+
+	/**
+	 * Fetch preset manifest from proxy. If available, enables switchable mode.
+	 */
+	async fetchPresets(): Promise<void> {
+		try {
+			const manifest = await ModelsService.listPresets();
+			if (manifest && manifest.presets && Object.keys(manifest.presets).length > 1) {
+				this.presets = manifest.presets;
+				this._activePreset = manifest.active;
+				this._isSwitchable = true;
+			} else {
+				// Manifest no longer qualifies — reset switchable state
+				this.presets = {};
+				this._activePreset = null;
+				this._isSwitchable = false;
+			}
+		} catch {
+			// Endpoint not available — not switchable
+		}
+	}
+
+	private static readonly SWITCH_TIMEOUT_MS = 120_000;
+	private switchTimeout: ReturnType<typeof setTimeout> | null = null;
+
+	/**
+	 * Switch to a different model preset.
+	 */
+	async switchModel(preset: string): Promise<void> {
+		if (this.switching) return;
+
+		this.switching = true;
+		this.switchError = null;
+
+		try {
+			await ModelsService.switchModel(preset);
+			// SSE events drive the lifecycle — set a safety timeout
+			// in case the proxy crashes and no event arrives.
+			this.switchTimeout = setTimeout(() => {
+				this.switchTimeout = null;
+				if (this.switching) {
+					this.switching = false;
+					this.switchError = 'Switch timed out — no response from server';
+					toast.error('Model switch timed out');
+				}
+			}, ModelsStore.SWITCH_TIMEOUT_MS);
+		} catch (error) {
+			// Network error — request never reached the server, so no SSE will follow.
+			this.switching = false;
+			const msg = error instanceof Error ? error.message : 'Switch failed';
+			this.switchError = msg;
+			toast.error(`Model switch failed: ${msg}`);
+			throw error;
+		}
+	}
+
+	/** Called by EventsService when a switch terminal event arrives. */
+	clearSwitchTimeout(): void {
+		if (this.switchTimeout) {
+			clearTimeout(this.switchTimeout);
+			this.switchTimeout = null;
+		}
+	}
+
+	/**
+	 *
+	 *
 	 * Utilities
 	 *
 	 *
@@ -722,3 +814,6 @@ export const propsCacheVersion = () => modelsStore.propsCacheVersion;
 export const singleModelName = () => modelsStore.singleModelName;
 export const selectedModelContextSize = () => modelsStore.selectedModelContextSize;
 export const favoriteModelIds = () => modelsStore.favoriteModelIds;
+export const isSwitchable = () => modelsStore.isSwitchable;
+export const activePreset = () => modelsStore.activePreset;
+export const switching = () => modelsStore.switching;
