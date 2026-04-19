@@ -260,3 +260,14 @@ export { ParameterSyncService } from './parameter-sync.service';
  * @see MCP Protocol Specification: https://modelcontextprotocol.io/specification/2025-06-18
  */
 export { MCPService } from './mcp.service';
+
+/**
+ * **EventsService** - SSE client for proxy push notifications
+ *
+ * Connects to GET /api/events for real-time model switch state.
+ * Auto-reconnects natively. Reconciles state on every reconnect.
+ *
+ * @see modelsStore — receives model switch events
+ * @see serverStore — refreshed on reconnect for server state sync
+ */
+export { EventsService } from './events.service';
