@@ -26,10 +26,11 @@ export const rehypeResolveCitations: Plugin<[SourceItem[]], Root> = (sources) =>
 	return (tree: Root) => {
 		if (!sources.length) return;
 
-		// Build source lookup by index
+		// Build source lookup by cite_index (original global index for [N] mapping).
+		// Falls back to index when cite_index is absent (backward compat).
 		const sourceMap = new Map<number, SourceItem>();
 		for (const s of sources) {
-			sourceMap.set(s.index, s);
+			sourceMap.set(s.cite_index ?? s.index, s);
 		}
 
 		// Detect 0-indexed vs 1-indexed by checking if [0] appears in text
@@ -69,7 +70,10 @@ export const rehypeResolveCitations: Plugin<[SourceItem[]], Root> = (sources) =>
 					}
 
 					if (source) {
-						// Resolved citation → superscript link
+						// Resolved citation → superscript link.
+						// Display source.index + 1 (contiguous) rather than the raw
+						// citNum so the superscript matches the re-densified footer.
+						const displayNum = source.index + 1;
 						parts.push({
 							type: 'element',
 							tagName: 'a',
@@ -80,7 +84,7 @@ export const rehypeResolveCitations: Plugin<[SourceItem[]], Root> = (sources) =>
 								target: '_blank',
 								rel: 'noopener noreferrer'
 							},
-							children: [{ type: 'text', value: `[${citNum}]` }]
+							children: [{ type: 'text', value: `[${displayNum}]` }]
 						});
 					}
 					// Out-of-range citations are stripped (nothing pushed)

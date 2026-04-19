@@ -3,9 +3,11 @@
 
 	interface Props {
 		sources: SourceItem[];
+		/** True when the final filtered sources list has been received. */
+		final?: boolean;
 	}
 
-	let { sources }: Props = $props();
+	let { sources, final: isFinal = false }: Props = $props();
 
 	const PREVIEW_COUNT = 3;
 	let expanded = $state(false);
@@ -23,10 +25,10 @@
 {#if sources.length > 0}
 	<div class="sources-footer">
 		<button class="sources-header" onclick={() => expanded = !expanded}>
-			<span class="sources-label">{sources.length} Source{sources.length !== 1 ? 's' : ''}</span>
+			<span class="sources-label">{isFinal ? `${sources.length} ` : ''}Source{sources.length !== 1 ? 's' : ''}</span>
 			<span class="sources-toggle">
 				{#if hasMore}
-					{expanded ? 'Collapse' : `Show all ${sources.length}`}
+					{expanded ? 'Collapse' : isFinal ? `Show all ${sources.length}` : 'Expand'}
 				{:else}
 					{expanded ? 'Collapse' : 'Expand'}
 				{/if}
@@ -51,7 +53,7 @@
 				<button class="show-more" onclick={() => expanded = false}>
 					Show fewer
 				</button>
-			{:else}
+			{:else if isFinal}
 				<button class="show-more" onclick={() => expanded = true}>
 					+{sources.length - PREVIEW_COUNT} more source{sources.length - PREVIEW_COUNT !== 1 ? 's' : ''}
 				</button>
