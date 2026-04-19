@@ -6,8 +6,8 @@
 		SyntaxHighlightedCode
 	} from '$lib/components/app';
 	import { config } from '$lib/stores/settings.svelte';
-	import { Wrench, Loader2, Brain } from '@lucide/svelte';
-	import { AgenticSectionType, FileTypeText } from '$lib/enums';
+	import { Wrench, Loader2, AlertTriangle, Brain, Search } from '@lucide/svelte';
+	import { AgenticSectionType, AttachmentType, FileTypeText } from '$lib/enums';
 	import { formatJsonPretty } from '$lib/utils';
 	import {
 		deriveAgenticSections,
@@ -29,6 +29,7 @@
 	let { message, toolMessages = [], isStreaming = false, highlightTurns = false }: Props = $props();
 
 	let expandedStates: Record<number, boolean> = $state({});
+	let condensedExpanded = $state(false);
 
 	const showToolCallInProgress = $derived(config().showToolCallInProgress as boolean);
 	const showThoughtInProgress = $derived(config().showThoughtInProgress as boolean);
@@ -44,6 +45,78 @@
 				: ([] as ToolResultLine[])
 		}))
 	);
+
+	// Regex matching orchestrator's web_search status messages (primary + follow-up pools)
+	const SEARCH_STATUS_RE =
+		/^(Searching|Looking that up|Checking online|Let me search|Also searching|And looking|Plus checking)/i;
+
+	// Condense intermediate tool-calling steps when 2+ iterations detected
+	const condensedInfo = $derived.by(() => {
+		if (isStreaming) return null;
+
+		// Find all TEXT sections and identify the last one (the final response)
+		const textEntries = sectionsParsed
+			.map((s, i) => ({ s, i }))
+			.filter(({ s }) => s.type === AgenticSectionType.TEXT);
+
+		if (textEntries.length < 2) return null;
+
+		const lastTextIdx = textEntries[textEntries.length - 1].i;
+
+		// Collect intermediate status messages: short, contain "…", not the final response
+		type Step = {
+			statusText: string;
+			reasoningContent?: string;
+			statusIdx: number;
+			reasoningIdx?: number;
+		};
+		const steps: Step[] = [];
+
+		for (const { s, i } of textEntries) {
+			if (i === lastTextIdx) continue;
+			const trimmed = s.content.trim();
+			if (trimmed.length < 300 && trimmed.includes('\u2026')) {
+				const step: Step = { statusText: trimmed, statusIdx: i };
+				// Check for following reasoning block (model's reaction to tool results)
+				if (
+					i + 1 < sectionsParsed.length &&
+					sectionsParsed[i + 1].type === AgenticSectionType.REASONING
+				) {
+					step.reasoningIdx = i + 1;
+					step.reasoningContent = sectionsParsed[i + 1].content;
+				}
+				steps.push(step);
+			}
+		}
+
+		if (steps.length < 2) return null;
+
+		// Build set of indices to skip in normal rendering
+		const skipIndices = new Set<number>();
+		for (const step of steps) {
+			skipIndices.add(step.statusIdx);
+			if (step.reasoningIdx !== undefined) skipIndices.add(step.reasoningIdx);
+		}
+
+		// Determine title: "N web searches" if all steps match search patterns, else "N tool calls"
+		const allSearches = steps.every((step) => {
+			// For multi-line status texts (batched tool calls), check every line
+			const lines = step.statusText.split('\n').filter((l) => l.trim());
+			return lines.every((line) => SEARCH_STATUS_RE.test(line.trim()));
+		});
+
+		const title = allSearches
+			? `${steps.length} web searches`
+			: `${steps.length} tool calls`;
+
+		return {
+			steps,
+			skipIndices,
+			insertAtIndex: Math.min(...skipIndices),
+			title,
+			allSearches
+		};
+	});
 
 	// Group flat sections into agentic turns
 	// A new turn starts when a non-tool section follows a tool section
@@ -121,7 +194,7 @@
 {#snippet renderSection(section: (typeof sectionsParsed)[number], index: number)}
 	{#if section.type === AgenticSectionType.TEXT}
 		<div class="agentic-text">
-			<MarkdownContent content={section.content} attachments={message?.extra} />
+			<MarkdownContent content={section.content.trim()} attachments={message?.extra} />
 		</div>
 	{:else if section.type === AgenticSectionType.TOOL_CALL_STREAMING}
 		{@const streamingIcon = isStreaming ? Loader2 : Loader2}
@@ -286,7 +359,53 @@
 		{/each}
 	{:else}
 		{#each sectionsParsed as section, index (index)}
-			{@render renderSection(section, index)}
+			{#if condensedInfo && condensedInfo.skipIndices.has(index)}
+				{#if index === condensedInfo.insertAtIndex}
+					{@const condensedIcon = condensedInfo.allSearches ? Search : Wrench}
+					<CollapsibleContentBlock
+						open={condensedExpanded}
+						class="my-2"
+						icon={condensedIcon}
+						title={condensedInfo.title}
+						onToggle={() => (condensedExpanded = !condensedExpanded)}
+					>
+						<div class="pt-2">
+							{#each condensedInfo.steps as step, stepIdx}
+								<div class="border-b border-muted/50 py-2 last:border-b-0">
+									<div class="text-xs text-muted-foreground whitespace-pre-line">
+										{step.statusText}
+									</div>
+									{#if step.reasoningContent}
+										<div class="mt-1.5">
+											<CollapsibleContentBlock
+												open={isExpanded(-(stepIdx + 1), {
+													type: AgenticSectionType.REASONING
+												} as AgenticSection)}
+												icon={Brain}
+												title="Reasoning"
+												onToggle={() =>
+													toggleExpanded(-(stepIdx + 1), {
+														type: AgenticSectionType.REASONING
+													} as AgenticSection)}
+											>
+												<div class="pt-2">
+													<div
+														class="text-xs leading-relaxed break-words whitespace-pre-wrap"
+													>
+														{step.reasoningContent}
+													</div>
+												</div>
+											</CollapsibleContentBlock>
+										</div>
+									{/if}
+								</div>
+							{/each}
+						</div>
+					</CollapsibleContentBlock>
+				{/if}
+			{:else}
+				{@render renderSection(section, index)}
+			{/if}
 		{/each}
 	{/if}
 </div>
