@@ -23,6 +23,8 @@
 		onEdit?: (id: string) => void;
 		onSelect?: (id: string) => void;
 		onStop?: (id: string) => void;
+		/** Closes the sidebar after a row tap on mobile. Optional — desktop callers don't pass it. */
+		handleMobileSidebarItemClick?: () => void;
 	}
 
 	let {
@@ -32,10 +34,10 @@
 		onSelect,
 		onStop,
 		isActive = false,
-		depth = 0
+		depth = 0,
+		handleMobileSidebarItemClick
 	}: Props = $props();
 
-	let renderActionsDropdown = $state(false);
 	let dropdownOpen = $state(false);
 
 	let isLoading = $derived(getAllLoadingChats().includes(conversation.id));
@@ -63,25 +65,10 @@
 		}
 	}
 
-	function handleMouseLeave() {
-		if (!dropdownOpen) {
-			renderActionsDropdown = false;
-		}
-	}
-
-	function handleMouseOver() {
-		renderActionsDropdown = true;
-	}
-
 	function handleSelect() {
+		handleMobileSidebarItemClick?.();
 		onSelect?.(conversation.id);
 	}
-
-	$effect(() => {
-		if (!dropdownOpen) {
-			renderActionsDropdown = false;
-		}
-	});
 
 	onMount(() => {
 		document.addEventListener('edit-active-conversation', handleGlobalEditEvent as EventListener);
@@ -95,14 +82,11 @@
 	});
 </script>
 
-<!-- svelte-ignore a11y_mouse_events_have_key_events -->
 <button
 	class="group flex min-h-9 w-full cursor-pointer items-center justify-between space-x-3 rounded-lg py-1.5 text-left transition-colors hover:bg-foreground/10 {isActive
 		? 'bg-foreground/5 text-accent-foreground'
 		: ''} px-3"
 	onclick={handleSelect}
-	onmouseover={handleMouseOver}
-	onmouseleave={handleMouseLeave}
 >
 	<div
 		class="flex min-w-0 flex-1 items-center gap-2"
@@ -153,7 +137,6 @@
 		</span>
 	</div>
 
-	{#if renderActionsDropdown}
 		<div class="actions flex items-center">
 			<DropdownMenuActions
 				triggerIcon={MoreHorizontal}
@@ -186,7 +169,6 @@
 				]}
 			/>
 		</div>
-	{/if}
 </button>
 
 <style>
