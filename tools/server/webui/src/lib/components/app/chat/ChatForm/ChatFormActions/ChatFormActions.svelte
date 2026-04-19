@@ -8,7 +8,8 @@
 		ChatFormActionSubmit,
 		McpServersSelector,
 		ModelsSelector,
-		ModelsSelectorSheet
+		ModelsSelectorSheet,
+		ModelsSelectorSwitchable
 	} from '$lib/components/app';
 	import { SETTINGS_SECTION_TITLES } from '$lib/constants';
 	import { mcpStore } from '$lib/stores/mcp.svelte';
@@ -16,7 +17,7 @@
 	import { FileTypeCategory } from '$lib/enums';
 	import { getFileTypeCategory } from '$lib/utils';
 	import { config } from '$lib/stores/settings.svelte';
-	import { modelsStore, modelOptions, selectedModelId } from '$lib/stores/models.svelte';
+	import { modelsStore, modelOptions, selectedModelId, isSwitchable } from '$lib/stores/models.svelte';
 	import { isRouterMode, serverError } from '$lib/stores/server.svelte';
 	import { chatStore } from '$lib/stores/chat.svelte';
 	import { conversationsStore, activeMessages, activeThinkingEnabled } from '$lib/stores/conversations.svelte';
@@ -57,6 +58,7 @@
 	let currentConfig = $derived(config());
 	let isRouter = $derived(isRouterMode());
 	let isOffline = $derived(!!serverError());
+	let switchableMode = $derived(isSwitchable());
 
 	let conversationModel = $derived(
 		chatStore.getConversationModel(activeMessages() as DatabaseMessage[])
@@ -165,7 +167,7 @@
 		return '';
 	});
 
-	let selectorModelRef: ModelsSelector | ModelsSelectorSheet | undefined = $state(undefined);
+	let selectorModelRef: ModelsSelector | ModelsSelectorSheet | ModelsSelectorSwitchable | undefined = $state(undefined);
 
 	let isMobile = new IsMobile();
 
@@ -235,7 +237,13 @@
 	</div>
 
 	<div class="ml-auto flex items-center gap-1.5">
-		{#if isMobile.current}
+		{#if switchableMode}
+			<ModelsSelectorSwitchable
+				disabled={disabled || isOffline}
+				bind:this={selectorModelRef}
+				forceForegroundText
+			/>
+		{:else if isMobile.current}
 			<ModelsSelectorSheet
 				disabled={disabled || isOffline}
 				bind:this={selectorModelRef}

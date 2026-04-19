@@ -14,6 +14,7 @@
 	import * as Sidebar from '$lib/components/ui/sidebar/index.js';
 	import * as Tooltip from '$lib/components/ui/tooltip';
 	import { isRouterMode, serverStore } from '$lib/stores/server.svelte';
+	import { EventsService } from '$lib/services';
 	import { config, settingsStore } from '$lib/stores/settings.svelte';
 	import { ModeWatcher } from 'mode-watcher';
 	import { Toaster } from 'svelte-sonner';
@@ -126,11 +127,31 @@
 
 	// Initialize server properties on app load (run once)
 	$effect(() => {
-		// Only fetch if we don't already have props
 		if (!serverStore.props) {
 			untrack(() => {
 				serverStore.fetch();
 			});
+		}
+	});
+
+	// [parmesan] Eager preset fetch — don't wait for SSE onopen to discover
+	// switchable models.  EventsService.onopen still re-fetches on reconnect
+	// to reconcile after disconnects.
+	$effect(() => {
+		if (browser) {
+			untrack(() => {
+				modelsStore.fetchPresets();
+			});
+		}
+	});
+
+	// Connect to SSE events (onopen handler re-fetches presets on reconnect)
+	$effect(() => {
+		if (browser) {
+			untrack(() => {
+				EventsService.connect();
+			});
+			return () => EventsService.disconnect();
 		}
 	});
 

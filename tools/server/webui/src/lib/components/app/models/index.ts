@@ -110,3 +110,11 @@ export { default as ModelBadge } from './ModelBadge.svelte';
  * Respects the user's `showRawModelNames` setting.
  */
 export { default as ModelId } from './ModelId.svelte';
+
+/**
+ * **ModelsSelectorSwitchable** - Preset-based model switching dropdown
+ *
+ * For proxy-managed model switching (switchable mode).
+ * Uses preset manifest from /api/models instead of router model list.
+ */
+export { default as ModelsSelectorSwitchable } from './ModelsSelectorSwitchable.svelte';

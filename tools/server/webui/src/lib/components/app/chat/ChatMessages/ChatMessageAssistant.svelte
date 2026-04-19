@@ -23,7 +23,7 @@
 	import { Check, X } from '@lucide/svelte';
 	import { Button } from '$lib/components/ui/button';
 	import { Checkbox } from '$lib/components/ui/checkbox';
-	import { AGENTIC_TAGS, INPUT_CLASSES, REASONING_TAGS, RETRACTION_TAG } from '$lib/constants';
+	import { INPUT_CLASSES, RETRACTION_TAG } from '$lib/constants';
 	import { MessageRole, KeyboardKey, ChatMessageStatsView } from '$lib/enums';
 	import Label from '$lib/components/ui/label/label.svelte';
 	import { config } from '$lib/stores/settings.svelte';
