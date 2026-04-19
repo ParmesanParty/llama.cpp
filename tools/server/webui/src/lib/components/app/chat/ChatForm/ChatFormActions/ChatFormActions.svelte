@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Square, Brain } from '@lucide/svelte';
+	import { Square, Brain, BrainCircuit } from '@lucide/svelte';
 	import { Button } from '$lib/components/ui/button';
 	import * as Tooltip from '$lib/components/ui/tooltip';
 	import {
@@ -19,9 +19,14 @@
 	import { getFileTypeCategory } from '$lib/utils';
 	import { config } from '$lib/stores/settings.svelte';
 	import { modelsStore, modelOptions, selectedModelId, isSwitchable } from '$lib/stores/models.svelte';
-	import { isRouterMode, serverError } from '$lib/stores/server.svelte';
+	import { isRouterMode, serverError, preserveThinkingSupported } from '$lib/stores/server.svelte';
 	import { chatStore } from '$lib/stores/chat.svelte';
-	import { conversationsStore, activeMessages, activeThinkingEnabled } from '$lib/stores/conversations.svelte';
+	import {
+		conversationsStore,
+		activeMessages,
+		activeThinkingEnabled,
+		activePreserveThinking
+	} from '$lib/stores/conversations.svelte';
 	import { IsMobile } from '$lib/hooks/is-mobile.svelte';
 
 	interface Props {
@@ -225,32 +230,66 @@
 			{disabled}
 			onSettingsClick={() => chatSettingsDialog.open(SETTINGS_SECTION_TITLES.MCP)}
 		/>
-		<Tooltip.Root>
-			<Tooltip.Trigger>
-				<Button
-					variant="ghost"
-					size="icon"
-					onclick={() => conversationsStore.toggleThinking()}
-					class="h-8 w-8 rounded-full p-0"
-					{disabled}
-					aria-label={activeThinkingEnabled() ? 'Thinking enabled' : 'Thinking disabled'}
-					aria-pressed={activeThinkingEnabled()}
-				>
-					<Brain
-						class="h-4 w-4 {activeThinkingEnabled() ? 'text-primary' : 'text-muted-foreground'}"
-					/>
-				</Button>
-			</Tooltip.Trigger>
-			<Tooltip.Content>
-				<p>
-					{#if activeThinkingEnabled()}
-						Extended reasoning enabled — model will think before responding
-					{:else}
-						Extended reasoning disabled — model responds directly
-					{/if}
-				</p>
-			</Tooltip.Content>
-		</Tooltip.Root>
+		<div class="flex items-center">
+			<Tooltip.Root>
+				<Tooltip.Trigger>
+					<Button
+						variant="ghost"
+						size="icon"
+						onclick={() => conversationsStore.toggleThinking()}
+						class="h-8 w-8 rounded-full p-0"
+						{disabled}
+						aria-label={activeThinkingEnabled() ? 'Thinking enabled' : 'Thinking disabled'}
+						aria-pressed={activeThinkingEnabled()}
+					>
+						<Brain
+							class="h-4 w-4 {activeThinkingEnabled() ? 'text-primary' : 'text-muted-foreground'}"
+						/>
+					</Button>
+				</Tooltip.Trigger>
+				<Tooltip.Content>
+					<p>
+						{#if activeThinkingEnabled()}
+							Extended reasoning enabled — model will think before responding
+						{:else}
+							Extended reasoning disabled — model responds directly
+						{/if}
+					</p>
+				</Tooltip.Content>
+			</Tooltip.Root>
+			<Tooltip.Root>
+				<Tooltip.Trigger>
+					<Button
+						variant="ghost"
+						size="icon"
+						onclick={() => conversationsStore.togglePreserveThinking()}
+						class="h-8 w-8 rounded-full p-0"
+						disabled={disabled || !preserveThinkingSupported()}
+						aria-label={activePreserveThinking()
+							? 'Prior reasoning preserved'
+							: 'Prior reasoning not preserved'}
+						aria-pressed={activePreserveThinking()}
+					>
+						<BrainCircuit
+							class="h-4 w-4 {activePreserveThinking()
+								? 'text-primary'
+								: 'text-muted-foreground'}"
+						/>
+					</Button>
+				</Tooltip.Trigger>
+				<Tooltip.Content>
+					<p>
+						{#if !preserveThinkingSupported()}
+							Not supported by the active model
+						{:else if activePreserveThinking()}
+							Prior reasoning preserved across turns
+						{:else}
+							Prior reasoning not preserved
+						{/if}
+					</p>
+				</Tooltip.Content>
+			</Tooltip.Root>
+		</div>
 	</div>
 
 	<div class="ml-auto flex items-center gap-1.5">
