@@ -42,6 +42,50 @@
 #include <omp.h>
 #endif
 
+// Parmesan: env-gated MMID phase-timing diagnostics (LLAMA_MMID_DIAG=1).
+// See ggml-moe-diag.h header for the contract. Used by the April 16 PP
+// regression investigation to measure sentinel-memset cost, groupby cost,
+// and chunked-matmul cost as a function of dual-path vs single-path ops.
+#include "ggml-moe-diag.h"
+
+// Thread-0-only accumulators. No atomics: a single MMID op is executed by a
+// compute-thread pool that never runs two ops concurrently on the same pool.
+static struct ggml_moe_diag_stat
+    g_mmid_op_total       = { "mmid.op_total",           0, 0, 0, 0 },
+    g_mmid_op_sentinel    = { "mmid.op_total.sentinel",  0, 0, 0, 0 },
+    g_mmid_op_normal      = { "mmid.op_total.normal",    0, 0, 0, 0 },
+    g_mmid_quant_cur      = { "mmid.quant_cur_t0",       0, 0, 0, 0 },
+    g_mmid_sentinel_memset= { "mmid.sentinel_memset_t0", 0, 0, 0, 0 },
+    g_mmid_groupby        = { "mmid.groupby_t0",         0, 0, 0, 0 },
+    g_mmid_barrier_wait   = { "mmid.barrier_wait_t0",    0, 0, 0, 0 },
+    g_mmid_compute        = { "mmid.chunked_matmul_t0",  0, 0, 0, 0 };
+
+static void ggml_mmid_diag_maybe_report(void) {
+    const uint64_t re = ggml_moe_diag_report_every();
+    if (g_mmid_op_total.count == 0 ||
+        (g_mmid_op_total.count % re) != 0) {
+        return;
+    }
+    fprintf(stderr, "WARN [mmid-diag] summary window (last %llu MMID ops)\n",
+            (unsigned long long)re);
+    ggml_moe_diag_report(&g_mmid_op_total);
+    ggml_moe_diag_report(&g_mmid_op_sentinel);
+    ggml_moe_diag_report(&g_mmid_op_normal);
+    ggml_moe_diag_report(&g_mmid_quant_cur);
+    ggml_moe_diag_report(&g_mmid_sentinel_memset);
+    ggml_moe_diag_report(&g_mmid_groupby);
+    ggml_moe_diag_report(&g_mmid_barrier_wait);
+    ggml_moe_diag_report(&g_mmid_compute);
+    ggml_moe_diag_reset(&g_mmid_op_total);
+    ggml_moe_diag_reset(&g_mmid_op_sentinel);
+    ggml_moe_diag_reset(&g_mmid_op_normal);
+    ggml_moe_diag_reset(&g_mmid_quant_cur);
+    ggml_moe_diag_reset(&g_mmid_sentinel_memset);
+    ggml_moe_diag_reset(&g_mmid_groupby);
+    ggml_moe_diag_reset(&g_mmid_barrier_wait);
+    ggml_moe_diag_reset(&g_mmid_compute);
+}
+
 #if defined(__ARM_FEATURE_SVE) || defined(__ARM_FEATURE_MATMUL_INT8)
 #undef GGML_USE_LLAMAFILE
 #endif
@@ -1532,6 +1576,17 @@ static void ggml_compute_forward_mul_mat_id(
     enum ggml_type    const vec_dot_type    = type_traits_cpu[type].vec_dot_type;
     ggml_from_float_t const from_float      = type_traits_cpu[vec_dot_type].from_float;
 
+    // Parmesan MMID_DIAG: thread-0-only wall-time markers. When the env gate
+    // is off, the enclosing `if (diag_on && ith == 0)` lets the compiler keep
+    // the paths here out of the hot body.
+    const int diag_on = (ith == 0) ? ggml_moe_diag_enabled() : 0;
+    uint64_t t_op_start = 0, t_after_quant = 0, t_after_memset = 0,
+             t_after_groupby = 0, t_after_barrier = 0;
+    uint64_t memset_bytes = 0;
+    if (diag_on) {
+        t_op_start = ggml_moe_diag_now_ns();
+    }
+
     // we don't support permuted src0 or src1
     GGML_ASSERT(nb00 == ggml_type_size(type));
     GGML_ASSERT(nb10 == ggml_type_size(src1->type));
@@ -1600,6 +1655,10 @@ static void ggml_compute_forward_mul_mat_id(
 #endif
     }
 
+    if (diag_on) {
+        t_after_quant = ggml_moe_diag_now_ns();
+    }
+
     if (ith == 0) {
         // Flag-gated sentinel-skip support. When the caller sets
         // GGML_MUL_MAT_ID_FLAG_SENTINEL in op_params[0], negative ids in the
@@ -1609,7 +1668,13 @@ static void ggml_compute_forward_mul_mat_id(
         // are then left at zero. Non-sentinel callers pay nothing here.
         const bool sentinel_skip = (dst->op_params[0] & GGML_MUL_MAT_ID_FLAG_SENTINEL) != 0;
         if (sentinel_skip) {
-            memset(dst->data, 0, ggml_nbytes(dst));
+            const size_t dst_bytes = ggml_nbytes(dst);
+            memset(dst->data, 0, dst_bytes);
+            if (diag_on) memset_bytes = (uint64_t)dst_bytes;
+        }
+
+        if (diag_on) {
+            t_after_memset = ggml_moe_diag_now_ns();
         }
 
         // initialize matrix_row_counts
@@ -1629,6 +1694,10 @@ static void ggml_compute_forward_mul_mat_id(
                 matrix_row_counts[i02] += 1;
             }
         }
+
+        if (diag_on) {
+            t_after_groupby = ggml_moe_diag_now_ns();
+        }
     }
 
     // reset current_chunk
@@ -1638,6 +1707,10 @@ static void ggml_compute_forward_mul_mat_id(
     }
 
     ggml_barrier(params->threadpool);
+
+    if (diag_on) {
+        t_after_barrier = ggml_moe_diag_now_ns();
+    }
 
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
         const int64_t cne1 = matrix_row_counts[cur_a];
@@ -1698,6 +1771,38 @@ static void ggml_compute_forward_mul_mat_id(
 
             current_chunk = atomic_fetch_add_explicit(current_chunk_ctr, 1, memory_order_relaxed);
         }
+    }
+
+    // Parmesan MMID_DIAG: record phase timings on thread 0 and auto-report.
+    // Thread 0's wall-clock exit approximates the op's overall wall time
+    // (the enclosing compute loop's barrier structure serializes workers at
+    // phase boundaries, so thread 0's forward progress tracks total op
+    // progress). Other threads' compute spans can differ at the tail —
+    // those are captured by stat.max vs stat.avg drift.
+    if (diag_on) {
+        const uint64_t t_end = ggml_moe_diag_now_ns();
+        const bool sentinel = (dst->op_params[0] & GGML_MUL_MAT_ID_FLAG_SENTINEL) != 0;
+
+        ggml_moe_diag_add(&g_mmid_op_total, t_end - t_op_start, 0);
+        if (sentinel) {
+            ggml_moe_diag_add(&g_mmid_op_sentinel, t_end - t_op_start, 0);
+        } else {
+            ggml_moe_diag_add(&g_mmid_op_normal,   t_end - t_op_start, 0);
+        }
+        ggml_moe_diag_add(&g_mmid_quant_cur,
+                          t_after_quant - t_op_start, 0);
+        if (sentinel) {
+            ggml_moe_diag_add(&g_mmid_sentinel_memset,
+                              t_after_memset - t_after_quant, memset_bytes);
+        }
+        ggml_moe_diag_add(&g_mmid_groupby,
+                          t_after_groupby - t_after_memset, 0);
+        ggml_moe_diag_add(&g_mmid_barrier_wait,
+                          t_after_barrier - t_after_groupby, 0);
+        ggml_moe_diag_add(&g_mmid_compute,
+                          t_end - t_after_barrier, 0);
+
+        ggml_mmid_diag_maybe_report();
     }
 }
 

@@ -12,6 +12,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
+#include "ggml-moe-diag.h"  // Parmesan: env-gated scheduler split timings
 
 #include <assert.h>
 #include <limits.h>
@@ -1691,9 +1692,68 @@ static void ggml_backend_sched_prefetch_next_split_inputs(
     }
 }
 
+// Parmesan MMID_DIAG: per-compute_splits accumulators. One call to
+// compute_splits corresponds to one graph (one ubatch at PP, one token at
+// decode). We track cumulative split-phase time broken down by backend
+// (CPU vs non-CPU) so the April 16 PP regression can see whether cold CPU
+// compute dominates, or whether sync/prefetch/drain overhead is the cost.
+//
+// These are call-scoped by reset at the top of compute_splits; the
+// per-call values are added to global accumulators at the bottom. Global
+// accumulators are thread-0 only — compute_splits is single-threaded by
+// construction (the backend scheduler dispatches async work but never
+// enters compute_splits reentrantly for the same sched).
+static ggml_moe_diag_stat g_split_call_total    = { "sched.call_total",       0, 0, 0, 0 };
+static ggml_moe_diag_stat g_split_cpu_compute   = { "sched.cpu_compute_ns",   0, 0, 0, 0 };
+static ggml_moe_diag_stat g_split_acc_compute   = { "sched.accel_compute_ns", 0, 0, 0, 0 };
+static ggml_moe_diag_stat g_split_cpu_drain     = { "sched.cpu_drain_ns",     0, 0, 0, 0 };
+static ggml_moe_diag_stat g_split_acc_drain     = { "sched.accel_drain_ns",   0, 0, 0, 0 };
+static ggml_moe_diag_stat g_split_input_copy    = { "sched.input_copy_ns",    0, 0, 0, 0 };
+static ggml_moe_diag_stat g_split_prefetch      = { "sched.prefetch_ns",      0, 0, 0, 0 };
+static ggml_moe_diag_stat g_split_n_cpu         = { "sched.n_cpu_splits",     0, 0, 0, 0 };
+static ggml_moe_diag_stat g_split_n_acc         = { "sched.n_accel_splits",   0, 0, 0, 0 };
+
+static void ggml_split_diag_maybe_report(void) {
+    const uint64_t re = ggml_moe_diag_sched_report_every();
+    if (g_split_call_total.count == 0 ||
+        (g_split_call_total.count % re) != 0) {
+        return;
+    }
+    fprintf(stderr,
+        "WARN [mmid-diag] sched summary (last %llu compute_splits calls)\n",
+        (unsigned long long)re);
+    ggml_moe_diag_report(&g_split_call_total);
+    ggml_moe_diag_report(&g_split_cpu_compute);
+    ggml_moe_diag_report(&g_split_acc_compute);
+    ggml_moe_diag_report(&g_split_cpu_drain);
+    ggml_moe_diag_report(&g_split_acc_drain);
+    ggml_moe_diag_report(&g_split_input_copy);
+    ggml_moe_diag_report(&g_split_prefetch);
+    ggml_moe_diag_report(&g_split_n_cpu);
+    ggml_moe_diag_report(&g_split_n_acc);
+    ggml_moe_diag_reset(&g_split_call_total);
+    ggml_moe_diag_reset(&g_split_cpu_compute);
+    ggml_moe_diag_reset(&g_split_acc_compute);
+    ggml_moe_diag_reset(&g_split_cpu_drain);
+    ggml_moe_diag_reset(&g_split_acc_drain);
+    ggml_moe_diag_reset(&g_split_input_copy);
+    ggml_moe_diag_reset(&g_split_prefetch);
+    ggml_moe_diag_reset(&g_split_n_cpu);
+    ggml_moe_diag_reset(&g_split_n_acc);
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
+
+    // Parmesan MMID_DIAG: per-call accumulators. Reset at top, added to
+    // global stats at bottom. Zero-overhead when diag gate is off.
+    const int diag_on = ggml_moe_diag_enabled();
+    uint64_t diag_t_call_start    = diag_on ? ggml_moe_diag_now_ns() : 0;
+    uint64_t call_cpu_compute_ns  = 0, call_acc_compute_ns  = 0;
+    uint64_t call_cpu_drain_ns    = 0, call_acc_drain_ns    = 0;
+    uint64_t call_input_copy_ns   = 0, call_prefetch_ns     = 0;
+    uint64_t call_n_cpu_splits    = 0, call_n_acc_splits    = 0;
 
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
@@ -1724,12 +1784,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // racing the D2H with attention's write to the scratch buffer.
         // The barrier flag lives on the split's first node (set in
         // llama-graph.cpp on the gate MUL_MAT_ID of the hot path).
+        // Parmesan MMID_DIAG: phase timers for this split.
+        uint64_t t_prefetch_start = 0, t_prefetch_end = 0,
+                 t_inputs_end = 0, t_drain_end = 0, t_compute_end = 0;
+        if (diag_on) t_prefetch_start = ggml_moe_diag_now_ns();
         if (sched_prefetch_enabled() &&
             split_id + 1 < sched->n_splits &&
             split->graph.n_nodes > 0 &&
             (split->graph.nodes[0]->flags & GGML_TENSOR_FLAG_SPLIT_BARRIER)) {
             ggml_backend_sched_prefetch_next_split_inputs(sched, &splits[split_id + 1]);
         }
+        if (diag_on) t_prefetch_end = ggml_moe_diag_now_ns();
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
@@ -1933,6 +1998,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // of the data), not on every backend. The pending event lives in
         // the source backend's context (it's where the cpy_tensor_async
         // queued the work). Iterating all backends would be wasteful.
+        if (diag_on) t_inputs_end = ggml_moe_diag_now_ns();
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             if (input_backend == NULL || input_backend == split_backend) {
@@ -1941,6 +2007,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             struct ggml_tensor * input_cpy = tensor_copy(split->inputs[input_id], split_backend_id, sched->cur_copy);
             ggml_backend_wait_input_ready(input_backend, input_cpy);
         }
+        if (diag_on) t_drain_end = ggml_moe_diag_now_ns();
 
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
@@ -1987,6 +2054,46 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
             }
         }
+
+        // Parmesan MMID_DIAG: close out this split's phase timers and
+        // classify by backend device type. CPU vs non-CPU (CUDA, etc.)
+        // is the split that matters for the dual-path analysis.
+        if (diag_on) {
+            t_compute_end = ggml_moe_diag_now_ns();
+            const uint64_t prefetch_ns = t_prefetch_end - t_prefetch_start;
+            const uint64_t copy_ns     = t_inputs_end   - t_prefetch_end;
+            const uint64_t drain_ns    = t_drain_end    - t_inputs_end;
+            const uint64_t compute_ns  = t_compute_end  - t_drain_end;
+            const enum ggml_backend_dev_type dev_type =
+                ggml_backend_dev_type(ggml_backend_get_device(split_backend));
+            const bool is_cpu = (dev_type == GGML_BACKEND_DEVICE_TYPE_CPU);
+            if (is_cpu) {
+                call_cpu_compute_ns += compute_ns;
+                call_cpu_drain_ns   += drain_ns;
+                call_n_cpu_splits   += 1;
+            } else {
+                call_acc_compute_ns += compute_ns;
+                call_acc_drain_ns   += drain_ns;
+                call_n_acc_splits   += 1;
+            }
+            call_input_copy_ns += copy_ns;
+            call_prefetch_ns   += prefetch_ns;
+        }
+    }
+
+    if (diag_on) {
+        const uint64_t call_total_ns =
+            ggml_moe_diag_now_ns() - diag_t_call_start;
+        ggml_moe_diag_add(&g_split_call_total,  call_total_ns,        0);
+        ggml_moe_diag_add(&g_split_cpu_compute, call_cpu_compute_ns,  0);
+        ggml_moe_diag_add(&g_split_acc_compute, call_acc_compute_ns,  0);
+        ggml_moe_diag_add(&g_split_cpu_drain,   call_cpu_drain_ns,    0);
+        ggml_moe_diag_add(&g_split_acc_drain,   call_acc_drain_ns,    0);
+        ggml_moe_diag_add(&g_split_input_copy,  call_input_copy_ns,   0);
+        ggml_moe_diag_add(&g_split_prefetch,    call_prefetch_ns,     0);
+        ggml_moe_diag_add(&g_split_n_cpu,       call_n_cpu_splits,    0);
+        ggml_moe_diag_add(&g_split_n_acc,       call_n_acc_splits,    0);
+        ggml_split_diag_maybe_report();
     }
 
     return GGML_STATUS_SUCCESS;
