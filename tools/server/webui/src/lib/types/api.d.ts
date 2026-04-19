@@ -214,6 +214,7 @@ export interface ApiChatCompletionRequest {
 	// Reasoning parameters
 	reasoning_format?: string;
 	enable_thinking?: boolean;
+	preserve_thinking?: boolean;
 	// Generation parameters
 	temperature?: number;
 	max_tokens?: number;

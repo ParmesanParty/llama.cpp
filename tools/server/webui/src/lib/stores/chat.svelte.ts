@@ -1724,6 +1724,7 @@ class ChatStore {
 
 		if (currentConfig.disableReasoningParsing) apiOptions.disableReasoningParsing = true;
 		apiOptions.enableThinking = !!conversationsStore.activeThinkingEnabled;
+		apiOptions.preserveThinking = !!conversationsStore.activePreserveThinking;
 
 		if (currentConfig.excludeReasoningFromContext) apiOptions.excludeReasoningFromContext = true;
 
