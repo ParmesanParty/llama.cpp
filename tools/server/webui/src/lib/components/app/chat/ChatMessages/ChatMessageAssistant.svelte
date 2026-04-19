@@ -372,6 +372,7 @@
 					<ChatMessageStatistics
 						promptTokens={agentic ? agentic.llm.prompt_n : message.timings.prompt_n}
 						promptMs={agentic ? agentic.llm.prompt_ms : message.timings.prompt_ms}
+						cachedTokens={agentic ? undefined : message.timings.cache_n}
 						predictedTokens={agentic ? agentic.llm.predicted_n : message.timings.predicted_n}
 						predictedMs={agentic ? agentic.llm.predicted_ms : message.timings.predicted_ms}
 						agenticTimings={agentic}
