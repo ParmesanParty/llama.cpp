@@ -18,6 +18,8 @@
 	import { rehypeEnhanceCodeBlocks } from './plugins/rehype/enhance-code-blocks';
 	import { rehypeResolveAttachmentImages } from './plugins/rehype/resolve-attachment-images';
 	import { rehypeRtlSupport } from './plugins/rehype/rehype-rtl-support';
+	import { rehypeResolveCitations } from './plugins/rehype/resolve-citations';
+	import type { CitationSource } from './plugins/rehype/resolve-citations';
 	import { remarkLiteralHtml } from './plugins/remark/literal-html';
 	import { copyCodeToClipboard, preprocessLaTeX, getImageErrorFallbackHtml } from '$lib/utils';
 	import {
@@ -45,6 +47,7 @@
 		content: string;
 		class?: string;
 		disableMath?: boolean;
+		sources?: CitationSource[];
 	}
 
 	interface MarkdownBlock {
@@ -53,7 +56,7 @@
 		contentHash?: string;
 	}
 
-	let { content, attachments, class: className = '', disableMath = false }: Props = $props();
+	let { content, attachments, class: className = '', disableMath = false, sources }: Props = $props();
 
 	let containerRef = $state<HTMLDivElement>();
 	let renderedBlocks = $state<MarkdownBlock[]>([]);
@@ -79,6 +82,7 @@
 
 	let processor = $derived(() => {
 		void attachments;
+		void sources;
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		let proc: any = remark().use(remarkGfm); // GitHub Flavored Markdown
 
@@ -95,13 +99,19 @@
 			proc = proc.use(rehypeKatex); // Render math using KaTeX
 		}
 
-		return proc
+		proc = proc
 			.use(rehypeHighlight, {
 				languages: lowlightAll,
 				aliases: { [FileTypeText.XML]: [FileTypeText.SVELTE, FileTypeText.VUE] }
 			}) // Add syntax highlighting
 			.use(rehypeRestoreTableHtml) // Restore limited HTML (e.g., <br>, <ul>) inside Markdown tables
-			.use(rehypeEnhanceLinks) // Add target="_blank" to links
+			.use(rehypeEnhanceLinks); // Add target="_blank" to links
+
+		if (sources && sources.length > 0) {
+			proc = proc.use(rehypeResolveCitations, sources);
+		}
+
+		return proc
 			.use(rehypeEnhanceCodeBlocks) // Wrap code blocks with header and actions
 			.use(rehypeResolveAttachmentImages, { attachments })
 			.use(rehypeRtlSupport) // Add bidirectional text support
@@ -1170,6 +1180,20 @@
 		div :global(blockquote:hover) {
 			background: var(--muted);
 		}
+	}
+
+	/* Citation links */
+	div :global(.citation-link) {
+		font-size: 0.75em;
+		vertical-align: super;
+		line-height: 0;
+		text-decoration: none;
+		color: var(--primary);
+		font-weight: 600;
+	}
+
+	div :global(.citation-link:hover) {
+		text-decoration: underline;
 	}
 
 	/* Image load error fallback */
