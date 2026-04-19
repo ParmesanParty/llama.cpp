@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { Square, Brain } from '@lucide/svelte';
 	import { Button } from '$lib/components/ui/button';
+	import * as Tooltip from '$lib/components/ui/tooltip';
 	import {
 		ChatFormActionAttachmentsDropdown,
 		ChatFormActionAttachmentsSheet,
@@ -224,16 +225,32 @@
 			{disabled}
 			onSettingsClick={() => chatSettingsDialog.open(SETTINGS_SECTION_TITLES.MCP)}
 		/>
-		<Button
-			variant="ghost"
-			size="icon"
-			onclick={() => conversationsStore.toggleThinking()}
-			class="h-8 w-8 rounded-full p-0"
-			{disabled}
-			title={activeThinkingEnabled() ? 'Thinking enabled' : 'Thinking disabled'}
-		>
-			<Brain class="h-4 w-4 {activeThinkingEnabled() ? 'text-primary' : 'text-muted-foreground'}" />
-		</Button>
+		<Tooltip.Root>
+			<Tooltip.Trigger>
+				<Button
+					variant="ghost"
+					size="icon"
+					onclick={() => conversationsStore.toggleThinking()}
+					class="h-8 w-8 rounded-full p-0"
+					{disabled}
+					aria-label={activeThinkingEnabled() ? 'Thinking enabled' : 'Thinking disabled'}
+					aria-pressed={activeThinkingEnabled()}
+				>
+					<Brain
+						class="h-4 w-4 {activeThinkingEnabled() ? 'text-primary' : 'text-muted-foreground'}"
+					/>
+				</Button>
+			</Tooltip.Trigger>
+			<Tooltip.Content>
+				<p>
+					{#if activeThinkingEnabled()}
+						Extended reasoning enabled — model will think before responding
+					{:else}
+						Extended reasoning disabled — model responds directly
+					{/if}
+				</p>
+			</Tooltip.Content>
+		</Tooltip.Root>
 	</div>
 
 	<div class="ml-auto flex items-center gap-1.5">

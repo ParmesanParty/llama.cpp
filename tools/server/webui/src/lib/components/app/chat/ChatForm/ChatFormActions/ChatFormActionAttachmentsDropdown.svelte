@@ -118,7 +118,14 @@
 					</Button>
 				</Tooltip.Trigger>
 
-				<Tooltip.Content>
+				<!--
+					align="start" anchors the tooltip to the trigger's left
+					edge instead of centering it. The + button is at the left
+					edge of the chat form (overflow:hidden), and the long
+					tooltip text extends right from the trigger to stay
+					inside the form bounds.
+				-->
+				<Tooltip.Content align="start">
 					<p>{fileUploadTooltipText}</p>
 				</Tooltip.Content>
 			</Tooltip.Root>
