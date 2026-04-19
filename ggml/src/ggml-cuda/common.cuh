@@ -1355,6 +1355,33 @@ struct ggml_backend_cuda_context {
     std::string name;
     cudaEvent_t copy_event = nullptr;
 
+    // Parmesan: async cross-backend copy infrastructure for the MoE hot
+    // cache dual-path. The copy_stream is dedicated for D2H copies that
+    // need to overlap with hot CUDA compute on the main stream(s).
+    // Allocated lazily on first cross-backend copy via
+    // ggml_backend_cuda_ensure_async_copy_resources().
+    cudaStream_t async_copy_stream = nullptr;
+
+    // Pool of recyclable CUDA events for the pending_d2h_events map below.
+    // Pre-allocated up to 128 events; events are taken on D2H queue and
+    // returned in wait_input_ready after the sync. Asserts on exhaustion;
+    // 128 is far above the 49-events-per-decode peak observed for the
+    // MoE hot cache use case.
+    std::vector<cudaEvent_t> async_event_pool;
+
+    // Pending D2H copy events keyed by destination host pointer. The
+    // ggml_backend_cuda_cpy_tensor_async D2H path inserts here; the
+    // ggml_backend_cuda_wait_input_ready scheduler hook drains entries
+    // matching the input_cpy's data pointer. Empty in steady state — every
+    // entry is consumed within the same scheduler pass that produced it.
+    std::unordered_map<void *, cudaEvent_t> pending_d2h_events;
+
+    // True once async_copy_stream and the event pool are initialized.
+    // ensure_async_copy_resources() does the actual allocation lazily so
+    // the first cross-backend copy pays the setup cost; later copies are
+    // free.
+    bool async_copy_resources_ready = false;
+
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};
 

@@ -185,11 +185,53 @@ void ggml_cuda_mul_mat_q(
         CUDA_CHECK(cudaGetLastError());
     }
 
+    // Parmesan (Phase 1 retrofit — see docs/superpowers/plans/2026-04-10-moe-
+    // hot-expert-cache.md): mm_ids_helper writes exactly
+    // `total_count = expert_bounds[n_experts]` entries into ids_src1/ids_dst,
+    // where total_count is the number of NON-SENTINEL (token, iex) pairs in
+    // the input ids tensor. For non-sentinel callers total_count equals the
+    // full `ne_get_rows` (every slot valid) and downstream processing is
+    // unchanged. For MoE hot-cache sentinel callers total_count < ne_get_rows
+    // and the tail of ids_src1/ids_dst is pool garbage — if quantize and MMQ
+    // iterate the full ne_get_rows they read uninitialized indices and either
+    // IMA (garbage outside src1_d) or scatter into the wrong dst rows
+    // (producing corrupted output).
+    //
+    // The fix is a single host-synchronous cudaMemcpy of the 4-byte
+    // `expert_bounds[n_experts]` value, then use it as the effective column
+    // count for quantize and MMQ. This skips the tail of ids_src1/ids_dst
+    // cleanly. When the flag-gated dst memset at the top of
+    // ggml_cuda_mul_mat_id has already zeroed those output rows, the
+    // sentinel semantics ("skipped slots == zero") hold by construction.
+    //
+    // Cost: one 4-byte host-device sync per MUL_MAT_ID call (~a few
+    // microseconds). Acceptable — the alternative (passing ne_get_rows
+    // through and letting the kernel process garbage) is incorrect.
+    int32_t total_count_host = 0;
+    CUDA_CHECK(cudaMemcpyAsync(&total_count_host, expert_bounds.get() + ne02,
+                               sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    const int64_t valid_ne_get_rows = total_count_host;
+    if (valid_ne_get_rows <= 0) {
+        // All-negative ids case: mm_ids_helper wrote zero compact entries.
+        // dst is already zero from the flag-gated memset at the top of
+        // ggml_cuda_mul_mat_id, so we can return early without running
+        // quantize or MMQ. This is the all-cold-experts branch of the hot
+        // cache dual-path, and returning here is semantically identical to
+        // "this MUL_MAT_ID contributed nothing".
+        return;
+    }
+
     const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * sizeof(block_q8_1)/QK8_1 +
         get_mmq_x_max_host(cc)*sizeof(block_q8_1_mmq);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
 
-    const int64_t ne11_flat = ne12*n_expert_used;
+    // Use the sentinel-aware valid_ne_get_rows as the effective column count
+    // for quantize and MMQ. For non-sentinel callers this equals the
+    // original ne_get_rows exactly; for sentinel callers it is the compact
+    // total that mm_ids_helper actually wrote. See the retrofit comment
+    // above on mmq.cu ~L184.
+    const int64_t ne11_flat = valid_ne_get_rows;
     const int64_t ne12_flat = 1;
     const int64_t ne13_flat = 1;
 
@@ -213,9 +255,12 @@ void ggml_cuda_mul_mat_q(
     const int64_t s13 = ne12*s12;
 
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
+    // ne1 / s01 are passed the compact valid_ne_get_rows instead of the
+    // raw ne_get_rows so MMQ iterates only the entries that mm_ids_helper
+    // actually wrote.
     const mmq_args args = {
         src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), dst_d,
-        ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
+        ne00, ne01, valid_ne_get_rows, s01, valid_ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
         use_stream_k, ne12};

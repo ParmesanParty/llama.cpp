@@ -2933,6 +2933,7 @@ static ggml_backend_i ggml_backend_webgpu_i = {
     /* .graph_compute           = */ ggml_backend_webgpu_graph_compute,
     /* .event_record            = */ ggml_backend_webgpu_event_record,
     /* .event_wait              = */ ggml_backend_webgpu_event_wait,
+    /* .wait_input_ready        = */ NULL,
     /* .graph_optimize          = */ NULL,
 };
 

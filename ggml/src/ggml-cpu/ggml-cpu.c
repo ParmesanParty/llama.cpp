@@ -1601,14 +1601,28 @@ static void ggml_compute_forward_mul_mat_id(
     }
 
     if (ith == 0) {
+        // Flag-gated sentinel-skip support. When the caller sets
+        // GGML_MUL_MAT_ID_FLAG_SENTINEL in op_params[0], negative ids in the
+        // ids tensor mean "skip this slot; produce zero output". The kernel
+        // only writes into dst rows whose id participates in a group, so
+        // we zero-init dst up front; slots corresponding to sentinel ids
+        // are then left at zero. Non-sentinel callers pay nothing here.
+        const bool sentinel_skip = (dst->op_params[0] & GGML_MUL_MAT_ID_FLAG_SENTINEL) != 0;
+        if (sentinel_skip) {
+            memset(dst->data, 0, ggml_nbytes(dst));
+        }
+
         // initialize matrix_row_counts
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
 
-        // group rows by src0 matrix
+        // group rows by src0 matrix (negative ids are sentinels: skip when enabled)
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
             for (int id = 0; id < n_ids; ++id) {
                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
 
+                if (sentinel_skip && i02 < 0) {
+                    continue;  // sentinel entry; dst slot stays zero from the upstream memset
+                }
                 assert(i02 >= 0 && i02 < n_as);
 
                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};

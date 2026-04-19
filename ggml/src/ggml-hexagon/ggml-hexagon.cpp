@@ -2901,6 +2901,7 @@ static struct ggml_backend_i hexagon_backend_i = {
     /* .graph_compute           = */ ggml_backend_hexagon_graph_compute,
     /* .event_record            = */ NULL,
     /* .event_wait              = */ NULL,
+    /* .wait_input_ready        = */ NULL,
     /* .graph_optimize          = */ ggml_backend_hexagon_graph_optimize,
 };
 

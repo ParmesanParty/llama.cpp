@@ -578,6 +578,7 @@ static ggml_backend_i ggml_backend_metal_i = {
     /* .graph_compute           = */ ggml_backend_metal_graph_compute,
     /* .event_record            = */ ggml_backend_metal_event_record,
     /* .event_wait              = */ ggml_backend_metal_event_wait,
+    /* .wait_input_ready        = */ NULL,
     /* .graph_optimize          = */ ggml_backend_metal_graph_optimize,
 };
 
