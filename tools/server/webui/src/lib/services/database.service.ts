@@ -34,13 +34,18 @@ export class DatabaseService {
 	 * @param name - Name of the conversation
 	 * @returns The created conversation
 	 */
-	static async createConversation(name: string, enableThinking?: boolean): Promise<DatabaseConversation> {
+	static async createConversation(
+		name: string,
+		enableThinking?: boolean,
+		preserveThinking?: boolean,
+	): Promise<DatabaseConversation> {
 		const conversation: DatabaseConversation = {
 			id: uuid(),
 			name,
 			lastModified: Date.now(),
 			currNode: '',
-			enableThinking
+			enableThinking,
+			preserveThinking
 		};
 
 		await db.conversations.add(conversation);
