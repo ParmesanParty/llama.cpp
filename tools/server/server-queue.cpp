@@ -116,6 +116,16 @@ void server_queue::wait_until_no_sleep() {
     }
 }
 
+void server_queue::request_sleep() {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    if (sleeping) {
+        return;
+    }
+    req_force_sleep = true;
+    condition_tasks.notify_one();
+    condition_tasks.wait(lock, [&]{ return sleeping; });
+}
+
 void server_queue::terminate() {
     std::unique_lock<std::mutex> lock(mutex_tasks);
     running = false;
@@ -129,6 +139,10 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
     constexpr auto max_wait_time = std::chrono::seconds(1);
     auto should_sleep = [&]() -> bool {
         // caller must hold mutex_tasks
+        if (req_force_sleep) {
+            req_force_sleep = false;
+            return true;
+        }
         if (idle_sleep_ms < 0) {
             return false;
         }
@@ -178,6 +192,7 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
             if (should_sleep()) {
                 QUE_INF("%s", "entering sleeping state\n");
                 sleeping = true;
+                condition_tasks.notify_all();  // wake request_sleep() waiters
                 callback_sleeping_state(true);
                 req_stop_sleeping = false;
                 // wait until we are requested to exit sleeping state

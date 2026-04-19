@@ -3439,6 +3439,20 @@ void server_routes::init_routes() {
         return res;
     };
 
+    this->post_keepalive = [this](const server_http_req &) {
+        auto res = create_response(false); // wake model if sleeping
+        queue_tasks.touch();               // reset the idle timer
+        res->ok({{"status", "ok"}});
+        return res;
+    };
+
+    this->post_sleep = [this](const server_http_req &) {
+        auto res = create_response(true);  // bypass_sleep — don't wake if already sleeping
+        queue_tasks.request_sleep();
+        res->ok({{"status", "ok"}, {"sleeping", true}});
+        return res;
+    };
+
     this->get_metrics = [this](const server_http_req & req) {
         auto res = create_response();
         if (!params.endpoint_metrics) {

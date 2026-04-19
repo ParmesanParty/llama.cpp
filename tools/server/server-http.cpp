@@ -35,6 +35,7 @@ static void log_server_request(const httplib::Request & req, const httplib::Resp
     // skip logging requests that are regularly sent, to avoid log spam
     if (req.path == "/health"
         || req.path == "/v1/health"
+        || req.path == "/keepalive"
         || req.path == "/models"
         || req.path == "/v1/models"
         || req.path == "/props"
@@ -147,6 +148,7 @@ bool server_http_context::init(const common_params & params) {
             "/index.html",
             "/bundle.js",
             "/bundle.css",
+            "/keepalive"
         };
 
         // If API key is not set, skip validation

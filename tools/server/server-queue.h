@@ -16,6 +16,7 @@ private:
     bool running  = false;
     bool sleeping = false;
     bool req_stop_sleeping = false;
+    bool req_force_sleep   = false;
     int64_t time_last_task = 0;
 
     // queues
@@ -51,6 +52,12 @@ public:
     // returns immediately if not sleeping
     void wait_until_no_sleep();
 
+    // Request entering sleep state, block until sleeping.
+    // No-op if already sleeping.
+    // Note: if tasks are queued, they will be processed before sleep is entered.
+    // Callers should ensure no active tasks when immediate sleep is needed.
+    void request_sleep();
+
     bool is_sleeping() {
         std::unique_lock<std::mutex> lock(mutex_tasks);
         return sleeping;
@@ -74,6 +81,13 @@ public:
      * - Exit sleeping state
      */
     void start_loop(int64_t idle_sleep_ms = -1);
+
+    // Reset the idle timer without posting a task.
+    // Used by keepalive endpoints to prevent auto-sleep.
+    void touch() {
+        std::unique_lock<std::mutex> lock(mutex_tasks);
+        time_last_task = ggml_time_ms();
+    }
 
     // for metrics
     size_t queue_tasks_deferred_size() {
