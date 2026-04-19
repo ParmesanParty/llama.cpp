@@ -3980,6 +3980,122 @@ struct test_mul_mat_id : public test_case {
     }
 };
 
+// GGML_OP_MUL_MAT_ID with negative sentinel IDs (should skip and zero output).
+// Exercises the opt-in sentinel-skip path gated on GGML_MUL_MAT_ID_FLAG_SENTINEL:
+// kernels zero-init dst and skip any id < 0. Used by the MoE hot expert cache
+// to mask the hot/cold dual-path MUL_MAT_ID nodes.
+// Sentinel-skip variant of test_mul_mat_id. SCOPE: this case verifies two
+// things only — (1) cross-backend NMSE agreement when ~30% of ids are -1
+// sentinels (i.e., CPU and CUDA backends produce the same output for the
+// same flagged-input graph), and (2) the kernel does not crash when fed
+// negative ids while the GGML_MUL_MAT_ID_FLAG_SENTINEL bit is set in
+// op_params[0]. General correctness of MUL_MAT_ID for non-sentinel inputs
+// is covered by the existing test_mul_mat_id battery (~690 cases) — this
+// case is intentionally narrow and inherits the test_case backend-compare
+// pipeline rather than re-asserting against a hand-rolled reference.
+struct test_mul_mat_id_sentinel : public test_case {
+    const ggml_type type_a;
+    const ggml_type type_b;
+    const int n_mats;
+    const int n_used;
+    const bool b; // broadcast b matrix (mirrors test_mul_mat_id)
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+
+    std::string vars() override {
+        return VARS_TO_STR8(type_a, type_b, n_mats, n_used, b, m, n, k);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        // Upper bound — actual flops are lower because ~30% of ids are -1
+        // and the kernel skips those slots entirely. This is fine for the
+        // test runner's perf reporting; correctness is checked via NMSE.
+        return 2 * m * k * n * n_used;
+    }
+
+    test_mul_mat_id_sentinel(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
+            int n_mats = 8, int n_used = 4, bool b = false,
+            int64_t m = 32, int64_t n = 16, int64_t k = 32)
+        : type_a(type_a), type_b(type_b), n_mats(n_mats), n_used(n_used), b(b),
+            m(m), n(n), k(k) {
+            GGML_ASSERT(n_used <= n_mats);
+        }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // Match test_mul_mat_id layout exactly: as=[k,m,n_mats], ids=[n_mats,n] viewed to [n_used,n].
+        ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_set_name(as, "as");
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_set_name(ids, "ids");
+        if (n_used != n_mats) {
+            ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+            ggml_set_name(ids, "view_of_ids");
+        }
+
+        ggml_tensor * b_tensor = ggml_new_tensor_3d(ctx, type_b, k, this->b ? 1 : n_used, n);
+        ggml_set_name(b_tensor, "b");
+
+        ggml_tensor * out = ggml_mul_mat_id(ctx, as, b_tensor, ids);
+        ggml_set_name(out, "out");
+
+        // Opt in to sentinel-skip semantics. op_params is a public int32_t
+        // array on ggml_tensor, so we write the flag directly rather than
+        // depending on the internal ggml_set_op_params_i32 helper (which
+        // lives in ggml-impl.h and is not exported through ggml.h).
+        // Without this flag the kernel applies its original
+        // assert-on-negative path — which is the correct default for every
+        // other MoE model that never emits -1 ids.
+        out->op_params[0] = GGML_MUL_MAT_ID_FLAG_SENTINEL;
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        // Deterministic seed so failures reproduce exactly.
+        std::default_random_engine rng(1234);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                // Skip view ops — we fill the underlying ids tensor directly
+                // (matching init_mul_mat_id_tensors).
+                if (ggml_is_view_op(t->op)) { continue; }
+                // Fill each row with a shuffled permutation of [0..n_mats), then
+                // overwrite ~30% of entries with the -1 sentinel. Mirroring
+                // init_mul_mat_id_tensors' per-row uniqueness is critical:
+                // mm_ids_helper's nex_prev/it_compact accounting assumes each
+                // row is a set of distinct expert ids (as produced by router
+                // top-k in production). Random-with-replacement ids would
+                // double-count duplicates in nex_prev and break compaction
+                // across the whole kernel path, even though the kernel itself
+                // is correct — that would yield a test failure that has
+                // nothing to do with our sentinel-skip work.
+                std::uniform_real_distribution<float> f(0.0f, 1.0f);
+                std::vector<int32_t> data(t->ne[0]);
+                for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                    for (int i = 0; i < t->ne[0]; i++) {
+                        data[i] = i % n_mats;
+                    }
+                    std::shuffle(data.begin(), data.end(), rng);
+                    for (int i = 0; i < t->ne[0]; i++) {
+                        if (f(rng) < 0.3f) {
+                            data[i] = -1;
+                        }
+                    }
+                    ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
+                }
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_MUL_MAT_ID + GGML_OP_ADD or GGML_OP_MUL
 struct test_mul_mat_id_fusion : public test_case {
     const ggml_type type_a;
@@ -8191,6 +8307,32 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+
+    // MUL_MAT_ID sentinel-skip variants. These exercise the opt-in
+    // GGML_MUL_MAT_ID_FLAG_SENTINEL path used by the MoE hot expert cache:
+    // the ids tensor mixes valid expert indices with -1 sentinels, and the
+    // kernel must skip the sentinel slots and produce zero output for them.
+    //
+    // Shape constraints: K-quants (Q4_K, etc.) require ne[0] % 256 == 0 at
+    // allocation, and Q8_0 requires ne[0] % 32 == 0 — violating these silently
+    // produces nb[1]=0 via integer division in ggml_new_tensor_impl(), after
+    // which ggml_mul_mat_id's !ggml_is_transposed(as) assertion fires far
+    // from the root cause. We pick block-aligned shapes that still exercise
+    // the right code paths:
+    //
+    // 1) F32xF32, k=32: baseline correctness without any quant scaling.
+    //    Smallest shape so the sentinel branch is exercised in its simplest form.
+    // 2) Q4_K, k=256, m=128: matches the quant family used by qwen3.5-122b-a10b.
+    //    MMVQ fast path, single-block row, minimum valid k.
+    // 3) Q4_K, k=512, m=512: exercises MMVQ tiling at shapes closer to the real
+    //    FFN, surfacing any tile-boundary sentinel bugs.
+    // 4) Q8_0, k=256 with b=true and n=17: non-power-of-two n and the broadcast
+    //    flag push the op into the ggml_cuda_mul_mat_id fallback loop (Task 1.4)
+    //    rather than MMVQ, so the fallback sentinel handling is also exercised.
+    test_cases.emplace_back(new test_mul_mat_id_sentinel(GGML_TYPE_F32,  GGML_TYPE_F32,  8, 4, false,  32, 16,  32));
+    test_cases.emplace_back(new test_mul_mat_id_sentinel(GGML_TYPE_Q4_K, GGML_TYPE_F32,  8, 4, false, 128, 16, 256));
+    test_cases.emplace_back(new test_mul_mat_id_sentinel(GGML_TYPE_Q4_K, GGML_TYPE_F32, 16, 8, false, 512, 16, 512));
+    test_cases.emplace_back(new test_mul_mat_id_sentinel(GGML_TYPE_Q8_0, GGML_TYPE_F32, 32, 8, true,  128, 17, 256));
 
     for (int bs : {1, 4, 512}) {
         for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K}) {

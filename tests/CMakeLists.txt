@@ -200,6 +200,11 @@ llama_build_and_test(test-chat-auto-parser.cpp WORKING_DIRECTORY ${PROJECT_SOURC
 llama_build_and_test(test-chat-template.cpp)
 llama_build_and_test(test-json-partial.cpp)
 llama_build_and_test(test-log.cpp)
+llama_build_and_test(test-moe-hot-cache.cpp)
+if (GGML_CUDA)
+    llama_build_and_test(test-async-cpy.cpp)
+    target_include_directories(test-async-cpy PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+endif()
 llama_build_and_test(
     test-peg-parser.cpp
     peg-parser/simple-tokenize.cpp
