@@ -12,6 +12,13 @@
 #include <random>
 #include <sstream>
 #include <fstream>
+#include <chrono>
+
+#include <sys/stat.h>
+
+// Protects mutable system_prompt/system_prompt_mtime in server_chat_params
+// from concurrent httplib worker threads during hot-reload
+static std::mutex mutex_system_prompt;
 
 json format_error_response(const std::string & message, const enum error_type type) {
     std::string type_str;
@@ -1023,6 +1030,88 @@ json oaicompat_chat_params_parse(
 
             } else if (type != "text") {
                 throw std::invalid_argument("unsupported content[].type");
+            }
+        }
+    }
+
+    // System prompt injection: prepend if configured and client didn't provide one
+    // Lock protects mutable system_prompt/system_prompt_mtime from concurrent requests
+    std::lock_guard<std::mutex> sp_lock(mutex_system_prompt);
+    if (!opt.system_prompt.empty() || !opt.system_prompt_path.empty()) {
+        // Hot-reload from file if path is set
+        if (!opt.system_prompt_path.empty()) {
+            struct stat st;
+            if (stat(opt.system_prompt_path.c_str(), &st) == 0 && st.st_mtime != opt.system_prompt_mtime) {
+                std::ifstream ifs(opt.system_prompt_path);
+                if (ifs.is_open()) {
+                    std::string content((std::istreambuf_iterator<char>(ifs)),
+                                         std::istreambuf_iterator<char>());
+                    while (!content.empty() && content.back() == '\n') {
+                        content.pop_back();
+                    }
+                    opt.system_prompt = std::move(content);
+                    opt.system_prompt_mtime = st.st_mtime;
+                }
+            }
+        }
+        if (!opt.system_prompt.empty()) {
+            bool has_system = !messages.empty() && messages[0].at("role") == "system";
+            if (!has_system) {
+                // Append current date + time-of-day bucket for temporal grounding
+                auto now = std::chrono::system_clock::now();
+                std::time_t now_t = std::chrono::system_clock::to_time_t(now);
+                std::tm tm_buf;
+                localtime_r(&now_t, &tm_buf);
+
+                // Date string: "Tuesday, March 18, 2026"
+                char date_buf[64];
+                std::strftime(date_buf, sizeof(date_buf), "%A, %B %e, %Y", &tm_buf);
+                std::string date_str(date_buf);
+                auto pos = date_str.find("  ");
+                if (pos != std::string::npos) {
+                    date_str.erase(pos, 1);
+                }
+
+                // Time-of-day bucket
+                int hour = tm_buf.tm_hour;
+                struct bucket { const char* label; int start; int end; };
+                static const bucket buckets[] = {
+                    {"late night",    0,  3},
+                    {"early morning", 4,  6},
+                    {"morning",       7, 10},
+                    {"midday",       11, 13},
+                    {"afternoon",    14, 16},
+                    {"evening",      17, 20},
+                    {"night",        21, 23},
+                };
+                const bucket* b = &buckets[0]; // default: late night
+                for (const auto& bk : buckets) {
+                    if (hour >= bk.start && hour <= bk.end) {
+                        b = &bk;
+                        break;
+                    }
+                }
+
+                // Timezone abbreviation
+                char tz_buf[16] = "";
+                std::strftime(tz_buf, sizeof(tz_buf), "%Z", &tm_buf);
+                std::string tz_str(tz_buf);
+
+                // Format: "Current date: Tuesday, March 18, 2026 (evening, 17:00–20:59 CDT)"
+                char bucket_buf[64];
+                std::snprintf(bucket_buf, sizeof(bucket_buf), "%s, %02d:00\xe2\x80\x93%02d:59",
+                              b->label, b->start, b->end);
+                std::string temporal = std::string("Current date: ") + date_str + " (" + bucket_buf;
+                if (!tz_str.empty()) {
+                    temporal += " " + tz_str;
+                }
+                temporal += ")";
+
+                std::string full_prompt = opt.system_prompt + "\n\n" + temporal;
+                messages.insert(messages.begin(), json{
+                    {"role", "system"},
+                    {"content", full_prompt}
+                });
             }
         }
     }
