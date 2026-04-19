@@ -284,9 +284,13 @@ export interface ApiRetractionEvent {
 export interface ApiSourcesEvent {
 	sources: Array<{
 		index: number;
+		/** Original global source index for [N] citation mapping (before re-densification). */
+		cite_index?: number;
 		title: string;
 		url: string;
 	}>;
+	/** When true, this is the final filtered sources list (replaces prior events). */
+	final?: boolean;
 }
 
 export interface ApiToolHealthEvent {
