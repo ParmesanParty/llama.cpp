@@ -161,6 +161,16 @@ struct llama_moe_hot_cache {
 
     struct llama_moe_hot_cache_layer * layers; // length n_layers
 
+    // F10 fix: model_il → cache_idx reverse lookup (replaces the linear
+    // scan in find_layer_by_model_il). The graph builder calls five
+    // accessors per MoE layer per build, each of which previously did an
+    // O(n_layers) scan. Sized to hparams.n_layer — rounded up at init —
+    // so dense layers in hybrid architectures index in cleanly and return
+    // nullptr via a -1 sentinel. Allocated once at init, freed in
+    // llama_moe_hot_cache_free.
+    int   model_il_to_cache_idx_len;
+    int * model_il_to_cache_idx;  // [model_il_to_cache_idx_len], -1 or cache idx
+
     // Rebalance scratch vectors (Finding 5 fix). Pre-reserved at init to
     // avoid per-rebalance heap churn; cleared at the top of each
     // hot_cache_rebalance call. Sizes:
@@ -172,6 +182,25 @@ struct llama_moe_hot_cache {
     std::vector<int32_t>                  rebalance_new_hot;
     std::vector<int>                      rebalance_swap_counts;
     std::vector<double>                   rebalance_layer_ent;
+
+    // Per-call scratch (Finding F6 fix). Hoisted from the inside of
+    // promote_layer / swap_layer to eliminate per-call heap churn during
+    // FILLING and at each STEADY rebalance tick. At 48 MoE layers × up to
+    // 8 promote calls per FILLING decode, the per-call vector allocs were
+    // ~380+ heap round-trips per decode. Resized once at init; cleared at
+    // the top of each user. Not thread-safe — post_decode is expected to
+    // run single-threaded.
+    //
+    //   swap_in_new:          size n_expert   bool mask of new hot set
+    //   swap_evict_slots:     reserved K      evicted slot indices
+    //   swap_promote_experts: reserved K      novel expert ids to promote
+    //   swap_cold_map_buf:    size n_expert   derived cold_map pushed to device
+    //   promote_new_experts:  reserved K      unique novel experts during FILLING
+    std::vector<uint8_t>  swap_in_new;
+    std::vector<int32_t>  swap_evict_slots;
+    std::vector<int32_t>  swap_promote_experts;
+    std::vector<int32_t>  swap_cold_map_buf;
+    std::vector<int32_t>  promote_new_experts;
 
     // Tensor metadata context + backing VRAM buffer. All per-layer hot tensors
     // live inside this single ggml_context; the backend_buffer owns their data.

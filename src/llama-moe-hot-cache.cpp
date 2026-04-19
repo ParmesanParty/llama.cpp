@@ -1,4 +1,5 @@
 #include "llama-moe-hot-cache.h"
+#include "llama-moe-perf.h"
 #include "llama-impl.h"
 #include "llama-context.h"
 #include "llama-graph.h"  // llm_graph_result::get_gf() for post-decode topk read
@@ -100,6 +101,17 @@ struct llama_moe_hot_cache * llama_moe_hot_cache_init(
     LLAMA_LOG_INFO(
         "%s: detected %d MoE layers (%d merged, %d split tensor format)\n",
         __func__, n_moe_layers, n_merged_layers, n_split_layers);
+
+    // [MOE-DIAG] WARN-prefixed mirror so the proxy stderr filter promotes this
+    // to INFO level in journalctl. Temporary; remove after the 24-vs-48
+    // investigation resolves. Gated on LLAMA_MOE_DIAG=1 to keep prod quiet.
+    if (getenv("LLAMA_MOE_DIAG") != nullptr) {
+        fprintf(stderr,
+            "WARN [moe-diag] cache init: detected %d MoE layers "
+            "(%d merged, %d split) out of %zu total model layers\n",
+            n_moe_layers, n_merged_layers, n_split_layers, model.layers.size());
+        fflush(stderr);
+    }
 
     auto * cache = (struct llama_moe_hot_cache *) calloc(1, sizeof(struct llama_moe_hot_cache));
     cache->mode = LLAMA_MOE_HOT_CACHE_FILLING;
@@ -269,6 +281,32 @@ struct llama_moe_hot_cache * llama_moe_hot_cache_init(
         hot_layer.window_counts = (uint32_t *) calloc(cache->n_expert, sizeof(uint32_t));
 
         moe_idx++;
+    }
+
+    // F10 fix: populate the model_il → cache_idx reverse lookup. Sized to
+    // hparams.n_layer so dense layers in hybrid architectures (Qwen3Next
+    // style recurrent + full-attention + MoE) index in cleanly and return
+    // -1 for the hot cache accessors, which the graph builder then treats
+    // as "no cache coverage for this layer — emit single-path". Matches
+    // the behavior of the old linear-scan find_layer_by_model_il.
+    cache->model_il_to_cache_idx_len = (int) model.layers.size();
+    cache->model_il_to_cache_idx = (int *) malloc(
+        (size_t) cache->model_il_to_cache_idx_len * sizeof(int));
+    if (cache->model_il_to_cache_idx == nullptr) {
+        LLAMA_LOG_ERROR(
+            "%s: failed to alloc model_il→cache_idx lookup (len=%d)\n",
+            __func__, cache->model_il_to_cache_idx_len);
+        llama_moe_hot_cache_free(cache);
+        return nullptr;
+    }
+    for (int i = 0; i < cache->model_il_to_cache_idx_len; ++i) {
+        cache->model_il_to_cache_idx[i] = -1;
+    }
+    for (int i = 0; i < cache->n_layers; ++i) {
+        const int m_il = cache->layers[i].model_il;
+        if (m_il >= 0 && m_il < cache->model_il_to_cache_idx_len) {
+            cache->model_il_to_cache_idx[m_il] = i;
+        }
     }
 
     // Allocate the backing backend buffer for all tensors in meta_ctx
@@ -484,6 +522,21 @@ struct llama_moe_hot_cache * llama_moe_hot_cache_init(
     cache->rebalance_swap_counts.resize((size_t) cache->n_layers, 0);
     cache->rebalance_layer_ent.resize((size_t) cache->n_layers, 0.0);
 
+    // F6: per-call scratch for promote_layer / swap_layer. Same placement-
+    // new pattern as rebalance_ranked above. Reserved/resized to their
+    // maximum footprint so the hot path (FILLING decode, STEADY rebalance)
+    // never touches the heap.
+    new (&cache->swap_in_new)          std::vector<uint8_t>();
+    new (&cache->swap_evict_slots)     std::vector<int32_t>();
+    new (&cache->swap_promote_experts) std::vector<int32_t>();
+    new (&cache->swap_cold_map_buf)    std::vector<int32_t>();
+    new (&cache->promote_new_experts)  std::vector<int32_t>();
+    cache->swap_in_new.resize((size_t) cache->n_expert, 0);
+    cache->swap_evict_slots.reserve((size_t) cache->K);
+    cache->swap_promote_experts.reserve((size_t) cache->K);
+    cache->swap_cold_map_buf.resize((size_t) cache->n_expert, 0);
+    cache->promote_new_experts.reserve((size_t) cache->K);
+
     return cache;
 }
 
@@ -558,6 +611,11 @@ void llama_moe_hot_cache_free(struct llama_moe_hot_cache * cache) {
         free(cache->layers);
     }
 
+    // F10: reverse lookup table allocated once at init.
+    free(cache->model_il_to_cache_idx);
+    cache->model_il_to_cache_idx = nullptr;
+    cache->model_il_to_cache_idx_len = 0;
+
     // Free the fused-cold kernel's scratch (Finding 6 fix: was file-scope
     // static, now owned by params on the cache). Safe on zero-initialized
     // params (first-call grow path leaves all pointers nullptr).
@@ -569,11 +627,18 @@ void llama_moe_hot_cache_free(struct llama_moe_hot_cache * cache) {
     using vec_pair_u32_int = std::vector<std::pair<uint32_t, int>>;
     using vec_i32          = std::vector<int32_t>;
     using vec_int          = std::vector<int>;
+    using vec_u8           = std::vector<uint8_t>;
     using vec_double       = std::vector<double>;
     cache->rebalance_ranked.~vec_pair_u32_int();
     cache->rebalance_new_hot.~vec_i32();
     cache->rebalance_swap_counts.~vec_int();
     cache->rebalance_layer_ent.~vec_double();
+    // F6: per-call scratch — same treatment.
+    cache->swap_in_new.~vec_u8();
+    cache->swap_evict_slots.~vec_i32();
+    cache->swap_promote_experts.~vec_i32();
+    cache->swap_cold_map_buf.~vec_i32();
+    cache->promote_new_experts.~vec_i32();
 
     free(cache);
 }
@@ -595,9 +660,21 @@ void llama_moe_hot_cache_free(struct llama_moe_hot_cache * cache) {
 
 static const struct llama_moe_hot_cache_layer * find_layer_by_model_il(
     const struct llama_moe_hot_cache * cache, int il) {
+    // F10 fix: O(1) table lookup (was linear over n_layers). The table is
+    // nullptr only for fake-cache unit tests that construct
+    // `llama_moe_hot_cache cache = {};` on the stack without going through
+    // init; fall back to the linear scan in that case so existing tests
+    // continue to work without plumbing the table through test setup.
     if (cache == nullptr || il < 0) {
         return nullptr;
     }
+    if (cache->model_il_to_cache_idx != nullptr) {
+        if (il >= cache->model_il_to_cache_idx_len) return nullptr;
+        const int idx = cache->model_il_to_cache_idx[il];
+        if (idx < 0 || idx >= cache->n_layers) return nullptr;
+        return &cache->layers[idx];
+    }
+    // Fallback for zero-initialized test caches (no init called).
     for (int i = 0; i < cache->n_layers; ++i) {
         if (cache->layers[i].model_il == il) {
             return &cache->layers[i];
@@ -753,11 +830,18 @@ void llama_moe_hot_cache_promote_layer(
 
     // Collect unique novel experts (bounds-checked, sentinel-filtered,
     // dedup'd against both hot_map_host and prior entries in new_experts).
-    // n_expert is typically 256, so a small stack-local dedup via
-    // hot_map_host is free — anything already in hot_map is skipped, and
-    // we dedup within the same call by checking new_experts inline.
-    std::vector<int32_t> new_experts;
-    new_experts.reserve((size_t) n_ids);
+    // n_expert is typically 256, so a small linear dedup via hot_map_host
+    // is free — anything already in hot_map is skipped, and we dedup
+    // within the same call by checking new_experts inline.
+    //
+    // F6: new_experts is the cache-owned `promote_new_experts` so we avoid
+    // the per-call heap alloc. Defensive clear+capacity reserve supports
+    // zero-init test caches where the vector was never placement-new'd.
+    // For test caches libstdc++'s de-facto-valid-empty-vector behavior
+    // keeps .clear()/.reserve() safe on zeroed storage.
+    auto & new_experts = cache->promote_new_experts;
+    new_experts.clear();
+    new_experts.reserve((size_t) cache->K);
     for (int i = 0; i < n_ids; ++i) {
         const int32_t e = ids[i];
         if (e < 0 || e >= cache->n_expert) continue;
@@ -805,6 +889,9 @@ void llama_moe_hot_cache_promote_layer(
 #ifdef GGML_USE_CUDA
     if (cache->ctx != nullptr && cache->copy_stream != nullptr &&
         cache->scratch != nullptr) {
+        const llama_moe_perf::time_point t_promote_start =
+            LLAMA_MOE_PERF_ON ? llama_moe_perf::now()
+                              : llama_moe_perf::time_point{};
 
         const auto & model_layer = cache->ctx->get_model().layers[layer.model_il];
         bool all_ok = true;
@@ -867,7 +954,8 @@ void llama_moe_hot_cache_promote_layer(
                 (size_t) cache->n_expert * sizeof(int32_t));
         }
         if (all_ok && layer.cold_map != nullptr) {
-            std::vector<int32_t> cold_map_buf((size_t) cache->n_expert);
+            // F6: reuse cache-owned scratch (sized to n_expert at init).
+            auto & cold_map_buf = cache->swap_cold_map_buf;
             llama_moe_hot_cache_build_cold_map(
                 cache->n_expert, layer.hot_map_host, cold_map_buf.data());
             ggml_backend_tensor_set(
@@ -888,6 +976,11 @@ void llama_moe_hot_cache_promote_layer(
                 layer.slot_to_expert[slot] = -1;
             }
             return;
+        }
+
+        if (LLAMA_MOE_PERF_ON) {
+            llama_moe_perf::stat_promote_stage.add(
+                llama_moe_perf::elapsed_us(t_promote_start));
         }
     }
 #endif  // GGML_USE_CUDA
@@ -915,16 +1008,32 @@ int llama_moe_hot_cache_swap_layer(
     }
     auto & layer = cache->layers[layer_idx];
 
+    // F6: defensive resize of cache-owned per-call scratch. init sizes
+    // them correctly; test harnesses zero-init the cache on the stack and
+    // depend on us growing the vectors here (same pattern as rebalance).
+    if ((int) cache->swap_in_new.size()       < cache->n_expert) cache->swap_in_new.resize((size_t) cache->n_expert, (uint8_t) 0);
+    if ((int) cache->swap_cold_map_buf.size() < cache->n_expert) cache->swap_cold_map_buf.resize((size_t) cache->n_expert, 0);
+    cache->swap_evict_slots.clear();
+    cache->swap_evict_slots.reserve((size_t) cache->K);
+    cache->swap_promote_experts.clear();
+    cache->swap_promote_experts.reserve((size_t) cache->K);
+
     // Phase 1: mark which experts the new set requires.
     // in_new[e] == true means "this expert should be hot after the swap".
     // Bounds-check each entry — caller may pass out-of-range ids (e.g., a
     // partial-sort top-K that includes zero-count slots up to K when the
     // layer's window has fewer than K distinct activations).
-    std::vector<bool> in_new((size_t) cache->n_expert, false);
+    //
+    // F6: swap_in_new is cache-owned (sized to n_expert at init). We use
+    // uint8_t rather than bool because std::vector<bool> is a bit-packed
+    // specialization and (a) is slower to write per-element and (b)
+    // precludes aliasing as raw bytes. Zero at top-of-call.
+    auto & in_new = cache->swap_in_new;
+    std::fill(in_new.begin(), in_new.end(), (uint8_t) 0);
     for (int i = 0; i < new_hot_len; ++i) {
         const int32_t e = new_hot_set[i];
         if (e >= 0 && e < cache->n_expert) {
-            in_new[(size_t) e] = true;
+            in_new[(size_t) e] = 1;
         }
     }
 
@@ -932,8 +1041,9 @@ int llama_moe_hot_cache_swap_layer(
     // Evicted experts: hot_map_host[e] is cleared and the slot is marked
     // empty (-1), so the Phase 3 promote loop correctly identifies them as
     // "not currently hot" and uses their slots for promotion.
-    std::vector<int32_t> evict_slots;
-    evict_slots.reserve((size_t) cache->K);
+    //
+    // F6: swap_evict_slots is cache-owned (reserved K at init).
+    auto & evict_slots = cache->swap_evict_slots;
     for (int slot = 0; slot < cache->K; ++slot) {
         const int32_t e = layer.slot_to_expert[slot];
         if (e < 0) continue;  // already empty slot (e.g., partial fill)
@@ -948,8 +1058,9 @@ int llama_moe_hot_cache_swap_layer(
     // "Shared" experts (in both old and new sets) are already hot from the
     // initial scan — the hot_map_host[e] >= 0 check skips them. Only novel
     // experts reach promote_experts.
-    std::vector<int32_t> promote_experts;
-    promote_experts.reserve((size_t) new_hot_len);
+    //
+    // F6: swap_promote_experts is cache-owned.
+    auto & promote_experts = cache->swap_promote_experts;
     for (int i = 0; i < new_hot_len; ++i) {
         const int32_t e = new_hot_set[i];
         if (e < 0 || e >= cache->n_expert) continue;
@@ -987,6 +1098,10 @@ int llama_moe_hot_cache_swap_layer(
     // skipped and only the host-side shadow is mutated. Tests can therefore
     // verify the swap logic on a fake cache without bringing up CUDA.
     if (cache->ctx != nullptr && cache->copy_stream != nullptr && n_swap > 0) {
+        const llama_moe_perf::time_point t_swap_start =
+            LLAMA_MOE_PERF_ON ? llama_moe_perf::now()
+                              : llama_moe_perf::time_point{};
+
         const auto & model_layer = cache->ctx->get_model().layers[layer.model_il];
 
         // Offset-disjoint scratch staging (Task 6b: extends Task 6's
@@ -1100,12 +1215,19 @@ int llama_moe_hot_cache_swap_layer(
                 (size_t) cache->n_expert * sizeof(int32_t));
         }
         if (layer.cold_map != nullptr) {
-            std::vector<int32_t> cold_map_buf((size_t) cache->n_expert);
+            // F6: reuse cache-owned scratch (sized to n_expert at init).
+            auto & cold_map_buf = cache->swap_cold_map_buf;
             llama_moe_hot_cache_build_cold_map(
                 cache->n_expert, layer.hot_map_host, cold_map_buf.data());
             ggml_backend_tensor_set(
                 layer.cold_map, cold_map_buf.data(), 0,
                 (size_t) cache->n_expert * sizeof(int32_t));
+        }
+
+        if (LLAMA_MOE_PERF_ON) {
+            llama_moe_perf::stat_swap_total.add(
+                llama_moe_perf::elapsed_us(t_swap_start));
+            llama_moe_perf::stat_swap_pairs.add_value((uint64_t) n_swap);
         }
     }
 #endif  // GGML_USE_CUDA
@@ -1153,6 +1275,10 @@ static void hot_cache_rebalance(
     if (cache == nullptr || cache->n_layers <= 0 || cache->K <= 0) {
         return;
     }
+
+    const llama_moe_perf::time_point t_rb_start =
+        LLAMA_MOE_PERF_ON ? llama_moe_perf::now()
+                          : llama_moe_perf::time_point{};
 
     // Reuse pre-reserved cache scratch (Finding 5 fix: was per-call heap
     // alloc of ~3.7 KB every 40 decodes). Clear/zero at the top of each
@@ -1233,6 +1359,10 @@ static void hot_cache_rebalance(
         hysteresis_bonus = steady_bonus;
     }
 
+    const llama_moe_perf::time_point t_sort_start =
+        LLAMA_MOE_PERF_ON ? llama_moe_perf::now()
+                          : llama_moe_perf::time_point{};
+
     for (int i = 0; i < cache->n_layers; ++i) {
         auto & layer = cache->layers[i];
         uint32_t * counts = layer.window_counts;
@@ -1295,6 +1425,11 @@ static void hot_cache_rebalance(
 
         // NOTE: window_counts zeroing DEFERRED — the telemetry write below
         // needs the counts alive to compute top-5 cold experts per layer.
+    }
+
+    if (LLAMA_MOE_PERF_ON) {
+        llama_moe_perf::stat_rb_sort.add(
+            llama_moe_perf::elapsed_us(t_sort_start));
     }
 
     // Count stable layers: layers where the hot set didn't change this tick.
@@ -1367,6 +1502,11 @@ static void hot_cache_rebalance(
                 n_stable,
                 cache->n_layers);
         }
+    }
+
+    if (LLAMA_MOE_PERF_ON) {
+        llama_moe_perf::stat_pd_rebalance.add(
+            llama_moe_perf::elapsed_us(t_rb_start));
     }
 }
 
@@ -1470,6 +1610,10 @@ static void snapshot_all_layer_ids_async(
     struct llama_context * ctx,
     std::vector<layer_argsort_snapshot> & snaps) {
 
+    const llama_moe_perf::time_point t_snap_start =
+        LLAMA_MOE_PERF_ON ? llama_moe_perf::now()
+                          : llama_moe_perf::time_point{};
+
     snaps.resize((size_t) cache->n_layers);
 
     ggml_backend_t cuda_backend = nullptr;
@@ -1520,6 +1664,7 @@ static void snapshot_all_layer_ids_async(
         ggml_backend_synchronize(cuda_backend);
     }
     // Retry any layers that overflowed the pinned budget via sync gets.
+    uint64_t overflow_count = 0;
     for (int i = 0; i < cache->n_layers; ++i) {
         auto & snap = snaps[(size_t) i];
         if (snap.valid || snap.n_expert_full <= 0) continue;
@@ -1529,6 +1674,15 @@ static void snapshot_all_layer_ids_async(
         // don't have room for that in the struct. Prefill ubatches are rare for
         // this code path since post_decode fires per-decode-call; if we ever
         // need to support large n_tokens here, grow ids_pinned.
+        ++overflow_count;
+    }
+
+    if (LLAMA_MOE_PERF_ON) {
+        llama_moe_perf::stat_pd_snapshot.add(
+            llama_moe_perf::elapsed_us(t_snap_start));
+        if (overflow_count > 0) {
+            llama_moe_perf::stat_pd_ids_overflow.add_value(overflow_count);
+        }
     }
 }
 
@@ -1599,6 +1753,10 @@ void llama_moe_hot_cache_post_decode(
         return;
     }
 
+    const llama_moe_perf::time_point t_pd_start =
+        LLAMA_MOE_PERF_ON ? llama_moe_perf::now()
+                          : llama_moe_perf::time_point{};
+
     // Decode-call counter — see the decode_counter / rebalance_interval field
     // comments in llama-moe-hot-cache.h. This fires once per successful
     // llama_decode() call, NOT once per token. Semantics are by design.
@@ -1666,10 +1824,47 @@ void llama_moe_hot_cache_post_decode(
             live_n_nodes == s_cached_n_nodes &&
             live_first_argsort == s_cached_first_argsort;
         if (!cache_valid) {
+            const llama_moe_perf::time_point t_idx_start =
+                LLAMA_MOE_PERF_ON ? llama_moe_perf::now()
+                                  : llama_moe_perf::time_point{};
             build_moe_graph_index(graph, gidx);
             s_cached_graph        = graph;
             s_cached_n_nodes      = live_n_nodes;
             s_cached_first_argsort = s_cached_gidx.argsort[0];
+            if (LLAMA_MOE_PERF_ON) {
+                llama_moe_perf::stat_pd_idx_build.add(
+                    llama_moe_perf::elapsed_us(t_idx_start));
+            }
+            // [MOE-DIAG] On every graph rebuild, log max_il and how many
+            // argsort slots are populated. If all 48 layers emit
+            // ffn_moe_argsort-<il>, we expect populated==48 at max_il==47.
+            // A lower populated count points at upstream graph emission
+            // (model builder not calling build_moe_ffn for some layers, or
+            // the scheduler culling nodes).
+            if (getenv("LLAMA_MOE_DIAG") != nullptr) {
+                int argsort_populated = 0;
+                int topk_populated    = 0;
+                int min_il = -1, max_il_seen = -1;
+                for (int j = 0; j <= gidx.max_il && j < 512; ++j) {
+                    if (gidx.argsort[j] != nullptr) {
+                        argsort_populated++;
+                        if (min_il < 0) min_il = j;
+                        max_il_seen = j;
+                    }
+                    if (gidx.topk[j]    != nullptr) topk_populated++;
+                }
+                fprintf(stderr,
+                    "WARN [moe-diag] graph_index rebuild: max_il=%d "
+                    "argsort_populated=%d topk_populated=%d "
+                    "il_range=[%d,%d] n_layers_cache=%d n_nodes=%d\n",
+                    gidx.max_il, argsort_populated, topk_populated,
+                    min_il, max_il_seen, cache->n_layers, live_n_nodes);
+                fflush(stderr);
+            }
+        } else if (LLAMA_MOE_PERF_ON) {
+            // Zero-work "reuse" sample — bumps the counter so the report
+            // shows how often we hit the cache vs rebuild.
+            llama_moe_perf::stat_pd_idx_reuse.add(0.0);
         }
     }
 
@@ -1687,6 +1882,11 @@ void llama_moe_hot_cache_post_decode(
     ids_buf.reserve(128);
 
     bool all_full = (cache->mode == LLAMA_MOE_HOT_CACHE_FILLING);
+
+    const llama_moe_perf::time_point t_accum_start =
+        LLAMA_MOE_PERF_ON ? llama_moe_perf::now()
+                          : llama_moe_perf::time_point{};
+    uint64_t promote_calls_this_decode = 0;
 
     for (int i = 0; i < cache->n_layers; ++i) {
         auto & hl = cache->layers[i];
@@ -1743,10 +1943,20 @@ void llama_moe_hot_cache_post_decode(
         if (cache->mode == LLAMA_MOE_HOT_CACHE_FILLING) {
             if (hl.current_size < cache->K) {
                 llama_moe_hot_cache_promote_layer(cache, i, ids_buf.data(), n_ids);
+                ++promote_calls_this_decode;
                 if (hl.current_size < cache->K) {
                     all_full = false;
                 }
             }
+        }
+    }
+
+    if (LLAMA_MOE_PERF_ON) {
+        llama_moe_perf::stat_pd_accumulate.add(
+            llama_moe_perf::elapsed_us(t_accum_start));
+        if (promote_calls_this_decode > 0) {
+            llama_moe_perf::stat_pd_promote.add_value(
+                promote_calls_this_decode);
         }
     }
 
@@ -1828,5 +2038,13 @@ void llama_moe_hot_cache_post_decode(
             "%s: hot cache FILLING → STEADY at decode #%lld "
             "(window_counts zeroed for clean first window)\n",
             __func__, (long long) cache->decode_counter);
+    }
+
+    if (LLAMA_MOE_PERF_ON) {
+        llama_moe_perf::stat_pd_total.add(
+            llama_moe_perf::elapsed_us(t_pd_start));
+        // Periodic flush — driven by stat_pd_total's call count, so this
+        // fires once per LLAMA_MOE_HOT_PERF_REPORT_EVERY decodes.
+        llama_moe_perf::maybe_report();
     }
 }
