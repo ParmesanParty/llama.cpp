@@ -108,6 +108,9 @@ class ConversationsStore {
 	/** Whether thinking is enabled for the active conversation */
 	activeThinkingEnabled = $state<boolean>(false);
 
+	/** Whether prior-turn reasoning is preserved for the active conversation */
+	activePreserveThinking = $state<boolean>(false);
+
 	/** Callback for title update confirmation dialog */
 	titleUpdateConfirmationCallback?: (currentTitle: string, newTitle: string) => Promise<boolean>;
 
@@ -245,7 +248,12 @@ class ConversationsStore {
 	async createConversation(name?: string): Promise<string> {
 		const conversationName = name || `Chat ${new Date().toLocaleString()}`;
 		const enableThinking = this.activeThinkingEnabled;
-		const conversation = await DatabaseService.createConversation(conversationName, enableThinking);
+		const preserveThinking = this.activePreserveThinking;
+		const conversation = await DatabaseService.createConversation(
+			conversationName,
+			enableThinking,
+			preserveThinking,
+		);
 
 		if (this.pendingMcpServerOverrides.length > 0) {
 			// Deep clone to plain objects (Svelte 5 $state uses Proxies which can't be cloned to IndexedDB)
@@ -285,6 +293,7 @@ class ConversationsStore {
 			this.pendingMcpServerOverrides = [];
 			this.activeConversation = conversation;
 			this.activeThinkingEnabled = conversation.enableThinking ?? !!config().enableThinking;
+			this.activePreserveThinking = conversation.preserveThinking ?? false;
 
 			if (conversation.currNode) {
 				const allMessages = await DatabaseService.getConversationMessages(convId);
@@ -315,6 +324,7 @@ class ConversationsStore {
 		// reload MCP defaults so new chats inherit persisted state
 		this.pendingMcpServerOverrides = ConversationsStore.loadMcpDefaults();
 		this.activeThinkingEnabled = !!config().enableThinking;
+		this.activePreserveThinking = false;
 	}
 
 	/**
@@ -444,6 +454,26 @@ class ConversationsStore {
 		if (this.activeConversation) {
 			await DatabaseService.updateConversation(this.activeConversation.id, {
 				enableThinking: enabled
+			});
+		}
+	}
+
+	/**
+	 * Toggles preserve-thinking (retain prior-turn reasoning) for the active conversation.
+	 */
+	async togglePreserveThinking(): Promise<void> {
+		await this.updatePreserveThinking(!this.activePreserveThinking);
+	}
+
+	/**
+	 * Updates preserve-thinking for the active conversation.
+	 * @param enabled - Whether prior-turn reasoning should be preserved across turns
+	 */
+	async updatePreserveThinking(enabled: boolean): Promise<void> {
+		this.activePreserveThinking = enabled;
+		if (this.activeConversation) {
+			await DatabaseService.updateConversation(this.activeConversation.id, {
+				preserveThinking: enabled
 			});
 		}
 	}
@@ -999,3 +1029,4 @@ export function buildConversationTree(convs: DatabaseConversation[]): Conversati
 	return result;
 }
 export const activeThinkingEnabled = () => conversationsStore.activeThinkingEnabled;
+export const activePreserveThinking = () => conversationsStore.activePreserveThinking;
