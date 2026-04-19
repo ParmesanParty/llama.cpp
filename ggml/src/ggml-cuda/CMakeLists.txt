@@ -181,6 +181,15 @@ if (CUDAToolkit_FOUND)
         target_link_libraries(ggml-cuda PRIVATE CUDA::cuda_driver)
     endif()
 
+    # NVTX profiling ranges — opt-in via GGML_CUDA_NVTX. When enabled, ggml-cuda
+    # emits nvtxRangePush/Pop around each node dispatch so nsys (or any NVTX
+    # consumer) can attribute GPU wall time per tensor name. Intentionally
+    # OFF by default so production builds don't pay the function-call overhead.
+    if (GGML_CUDA_NVTX)
+        target_link_libraries(ggml-cuda PRIVATE CUDA::nvToolsExt)
+        target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_NVTX)
+    endif()
+
     if (GGML_CUDA_NCCL)
         find_package(NCCL)
         if (NCCL_FOUND)
