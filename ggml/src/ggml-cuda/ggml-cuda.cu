@@ -601,6 +601,30 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
+
+    // Parmesan: tear down async copy resources if they were initialized.
+    if (async_copy_resources_ready) {
+        // Drain any in-flight pending events first — destroying an event
+        // that's still being used is undefined behavior. In steady state
+        // pending_d2h_events is empty (every entry is consumed by
+        // wait_input_ready in the same compute_splits pass). The drain
+        // here is defensive for the abnormal-shutdown case.
+        for (auto & kv : pending_d2h_events) {
+            CUDA_CHECK(cudaEventSynchronize(kv.second));
+        }
+        pending_d2h_events.clear();
+        for (cudaEvent_t event : async_event_pool) {
+            CUDA_CHECK(cudaEventDestroy(event));
+        }
+        async_event_pool.clear();
+
+        if (async_copy_stream != nullptr) {
+            CUDA_CHECK(cudaStreamDestroy(async_copy_stream));
+            async_copy_stream = nullptr;
+        }
+        async_copy_resources_ready = false;
+    }
+
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -1330,8 +1354,14 @@ static const char * ggml_backend_cuda_host_buffer_type_name(ggml_backend_buffer_
     GGML_UNUSED(buft);
 }
 
-static bool ggml_backend_buft_is_cuda_host(ggml_backend_buffer_type_t buft) {
-    return buft->iface.get_name == ggml_backend_cuda_host_buffer_type_name;
+// Parmesan: promoted from static to public so the scheduler can detect
+// pinned-host destinations for async D2H copies. The buft check is the
+// authoritative test for pinned host memory because
+// ggml_backend_cuda_host_buffer_type_alloc_buffer only stamps the cuda_host
+// buft on a buffer when cudaMallocHost succeeds (the fallback path returns
+// a plain CPU buffer with the cpu_buffer_type buft, which this rejects).
+GGML_BACKEND_API bool ggml_backend_buft_is_cuda_host(ggml_backend_buffer_type_t buft) {
+    return buft != nullptr && buft->iface.get_name == ggml_backend_cuda_host_buffer_type_name;
 }
 
 static void ggml_backend_cuda_host_buffer_free_buffer(ggml_backend_buffer_t buffer) {
@@ -2480,6 +2510,18 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
+    // Flag-gated dst zero-init: only runs for callers that opted into
+    // sentinel-skip semantics by setting GGML_MUL_MAT_ID_FLAG_SENTINEL in
+    // op_params[0]. Non-sentinel callers (qwen3moe, mixtral, deepseek,
+    // llama4, etc.) skip this entirely — zero baseline regression. Must
+    // run BEFORE any of the MMVQ fast-path dispatches below so the slots
+    // corresponding to -1 ids are readable as zero downstream. The memset
+    // is enqueued on the main compute stream and completes before any
+    // subsequent kernel launch on that same stream.
+    if (dst->op_params[0] & GGML_MUL_MAT_ID_FLAG_SENTINEL) {
+        CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), ctx.stream()));
+    }
+
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
@@ -3022,59 +3064,237 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
 
+// Parmesan: forward declarations for the async copy resource helpers
+// (defined after ggml_backend_cuda_synchronize, below this function).
+static bool ggml_backend_cuda_ensure_async_copy_resources(ggml_backend_cuda_context * ctx);
+static cudaEvent_t ggml_backend_cuda_acquire_event(ggml_backend_cuda_context * ctx);
+static void ggml_backend_cuda_release_event(ggml_backend_cuda_context * ctx, cudaEvent_t event);
+
 static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
     ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
     ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
 
-    if (!ggml_backend_is_cuda(backend_src) || !ggml_backend_is_cuda(backend_dst)) {
-        return false;
-    }
+    const bool src_is_cuda = ggml_backend_is_cuda(backend_src) && ggml_backend_buffer_is_cuda(buf_src);
+    const bool dst_is_cuda = ggml_backend_is_cuda(backend_dst) && ggml_backend_buffer_is_cuda(buf_dst);
 
-    if (!ggml_backend_buffer_is_cuda(buf_src) || !ggml_backend_buffer_is_cuda(buf_dst)) {
-        return false;
-    }
+    // Case 1: CUDA → CUDA (existing behavior, unchanged below in the
+    // device-to-device branch).
+    if (src_is_cuda && dst_is_cuda) {
+        // device -> device copy
+        ggml_backend_cuda_context * cuda_ctx_src = (ggml_backend_cuda_context *) backend_src->context;
+        ggml_backend_cuda_context * cuda_ctx_dst = (ggml_backend_cuda_context *) backend_dst->context;
 
-    // device -> device copy
-    ggml_backend_cuda_context * cuda_ctx_src = (ggml_backend_cuda_context *) backend_src->context;
-    ggml_backend_cuda_context * cuda_ctx_dst = (ggml_backend_cuda_context *) backend_dst->context;
+        ggml_backend_cuda_buffer_context * buf_ctx_src = (ggml_backend_cuda_buffer_context *) buf_src->context;
+        ggml_backend_cuda_buffer_context * buf_ctx_dst = (ggml_backend_cuda_buffer_context *) buf_dst->context;
 
-    ggml_backend_cuda_buffer_context * buf_ctx_src = (ggml_backend_cuda_buffer_context *) buf_src->context;
-    ggml_backend_cuda_buffer_context * buf_ctx_dst = (ggml_backend_cuda_buffer_context *) buf_dst->context;
-
-    if (cuda_ctx_src->device != buf_ctx_src->device || cuda_ctx_dst->device != buf_ctx_dst->device) {
+        if (cuda_ctx_src->device != buf_ctx_src->device || cuda_ctx_dst->device != buf_ctx_dst->device) {
 #ifndef NDEBUG
-        GGML_LOG_DEBUG("%s: backend and buffer devices do not match\n", __func__);
+            GGML_LOG_DEBUG("%s: backend and buffer devices do not match\n", __func__);
 #endif // NDEBUG
-        return false;
-    }
-
-    if (backend_src != backend_dst) {
-        // copy on src stream
-        if (cuda_ctx_src->device == cuda_ctx_dst->device) {
-            CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
-        } else {
-#ifdef GGML_CUDA_NO_PEER_COPY
             return false;
+        }
+
+        if (backend_src != backend_dst) {
+            // copy on src stream
+            if (cuda_ctx_src->device == cuda_ctx_dst->device) {
+                CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
+            } else {
+#ifdef GGML_CUDA_NO_PEER_COPY
+                return false;
 #else
-            CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, cuda_ctx_dst->device, src->data, cuda_ctx_src->device, ggml_nbytes(dst), cuda_ctx_src->stream()));
+                CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, cuda_ctx_dst->device, src->data, cuda_ctx_src->device, ggml_nbytes(dst), cuda_ctx_src->stream()));
 #endif // GGML_CUDA_NO_PEER_COPY
+            }
+
+            // record event on src stream after the copy
+            if (!cuda_ctx_src->copy_event) {
+                ggml_cuda_set_device(cuda_ctx_src->device);
+                CUDA_CHECK(cudaEventCreateWithFlags(&cuda_ctx_src->copy_event, cudaEventDisableTiming));
+            }
+
+            CUDA_CHECK(cudaEventRecord(cuda_ctx_src->copy_event, cuda_ctx_src->stream()));
+
+            // wait on dst stream for the copy to complete
+            CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx_dst->stream(), cuda_ctx_src->copy_event, 0));
+        } else {
+            // src and dst are on the same backend
+            CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
         }
-
-        // record event on src stream after the copy
-        if (!cuda_ctx_src->copy_event) {
-            ggml_cuda_set_device(cuda_ctx_src->device);
-            CUDA_CHECK(cudaEventCreateWithFlags(&cuda_ctx_src->copy_event, cudaEventDisableTiming));
-        }
-
-        CUDA_CHECK(cudaEventRecord(cuda_ctx_src->copy_event, cuda_ctx_src->stream()));
-
-        // wait on dst stream for the copy to complete
-        CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx_dst->stream(), cuda_ctx_src->copy_event, 0));
-    } else {
-        // src and dst are on the same backend
-        CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
+        return true;
     }
-    return true;
+
+    // Parmesan: Case 2 — CUDA → pinned host (D2H async fast path).
+    // The destination is in pinned host memory (cuda_host_buffer_type), so
+    // cudaMemcpyAsync can run truly asynchronously. We issue the copy on a
+    // dedicated copy stream so the memcpy can be ordered against a CUSTOM
+    // event (not the full compute stream queue), letting the scheduler's
+    // prefetch loop record the event BEFORE the next compute_async is queued.
+    // The completion event is stashed in pending_d2h_events for the consumer
+    // to drain via ggml_backend_cuda_wait_input_ready.
+    //
+    // The buft check is authoritative — see Task 6 Step 2 in the plan doc
+    // for why we don't need a runtime cudaPointerGetAttributes check.
+    if (src_is_cuda &&
+        ggml_backend_buffer_is_host(buf_dst) &&
+        ggml_backend_buft_is_cuda_host(buf_dst->buft)) {
+
+        ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend_src->context;
+        ggml_backend_cuda_buffer_context * buf_ctx_src = (ggml_backend_cuda_buffer_context *) buf_src->context;
+        if (ctx->device != buf_ctx_src->device) {
+            return false;  // multi-device weirdness — fall back to sync
+        }
+
+        // **Idempotency early-return.** If there's already a pending event
+        // for this destination pointer (e.g., from a prefetch in the
+        // scheduler's previous iteration), we are DONE — don't issue a
+        // duplicate copy. Issuing again would create a new event capturing
+        // the current compute stream state (which now includes whatever
+        // compute was queued AFTER the prefetch — i.e., hot for the
+        // dual-path), and the consumer's drain would then wait for that
+        // new event, defeating the parallelism the prefetch was supposed
+        // to enable. The existing pending event covers the data; the
+        // consumer will drain it via wait_input_ready when ready.
+        //
+        // This early-return is what makes the scheduler's prefetch +
+        // inline-issue pattern safe: the prefetch issues the copy, then
+        // the consuming split's inputs loop calls cpy_tensor_async again
+        // (because the existing slow-path doesn't know about the prefetch),
+        // and we hit this early return → return true → handled flag is set
+        // → sync fallback skipped → outer drain handles the prefetched
+        // copy. Without this check, the second issue would silently
+        // defeat the prefetch by capturing hot in a new event.
+        //
+        // The check happens BEFORE event acquisition so we don't waste an
+        // event slot from the pool.
+        if (ctx->pending_d2h_events.find(dst->data) != ctx->pending_d2h_events.end()) {
+            return true;
+        }
+
+        if (!ggml_backend_cuda_ensure_async_copy_resources(ctx)) {
+            return false;  // setup failed; caller falls back
+        }
+
+        // Acquire a "compute progress" event from the pool, record it on the
+        // compute stream so we capture all currently-queued work AT THIS
+        // MOMENT, then make the copy stream wait on it. After the
+        // cudaMemcpyAsync, we re-record the SAME event on the copy stream for
+        // the consumer to wait on. This saves one event slot per D2H.
+        //
+        // The CUDA semantics that make the dual-record safe:
+        //   - cudaStreamWaitEvent is enqueued at call time. It captures the
+        //     event's *current* state (the compute-stream record from a few
+        //     lines above) and snapshots that as the wait condition. Once
+        //     enqueued, the wait does NOT re-resolve when the event is
+        //     re-recorded — it tracks the snapshotted state forever.
+        //   - The subsequent cudaEventRecord on the copy stream creates a
+        //     new state for the event. cudaEventSynchronize() called from
+        //     the consumer (via wait_input_ready) waits for the LATEST
+        //     recorded state, which is the copy-stream record (downstream
+        //     of the memcpy).
+        // So the copy-stream wait still drains the compute-stream progress
+        // captured at the FIRST record, AND the consumer's sync drains the
+        // memcpy completion captured at the SECOND record. Both are correct
+        // because each user of the event captured its dependency at call
+        // time, not retroactively.
+        //
+        // CRITICAL for parallelism: the FIRST cudaEventRecord (on the
+        // compute stream) captures only what's queued at THIS moment. If
+        // the scheduler calls this function via the prefetch loop BEFORE
+        // queueing the next compute_async (e.g., before hot is queued), the
+        // event captures only the producer's work (e.g., attention) — NOT
+        // the next sibling compute. This is what enables hot to run in
+        // parallel with cold compute. See "Dispatch order analysis" in the
+        // plan doc for the full trace.
+        cudaEvent_t event = ggml_backend_cuda_acquire_event(ctx);
+        if (event == nullptr) {
+            return false;
+        }
+
+        ggml_cuda_set_device(ctx->device);
+
+        // Capture compute progress on the main stream and make the copy stream wait.
+        CUDA_CHECK(cudaEventRecord(event, ctx->stream()));
+        CUDA_CHECK(cudaStreamWaitEvent(ctx->async_copy_stream, event, 0));
+
+        // Async D2H on the copy stream (runs in parallel with compute stream).
+        CUDA_CHECK(cudaMemcpyAsync(
+            dst->data, src->data,
+            ggml_nbytes(src),
+            cudaMemcpyDeviceToHost,
+            ctx->async_copy_stream));
+
+        // Re-record the same event on the copy stream after the copy. The
+        // consumer (via wait_input_ready) will cudaEventSynchronize on it.
+        // Per the comment block above, this re-record does NOT invalidate
+        // the cudaStreamWaitEvent above — that wait was snapshotted at call
+        // time and tracks the original compute-stream record state.
+        CUDA_CHECK(cudaEventRecord(event, ctx->async_copy_stream));
+
+        // Stash by destination pointer for the consumer to look up.
+        ctx->pending_d2h_events[dst->data] = event;
+
+        return true;
+    }
+
+    // Parmesan: Case 3 — pinned host → CUDA (H2D async fast path).
+    // The source is in pinned host memory, so cudaMemcpyAsync can run truly
+    // asynchronously. The consumer is the next op on the dst CUDA backend's
+    // compute stream, so we issue the copy on the COMPUTE stream — CUDA's
+    // FIFO ordering naturally sequences the next op after the copy. No
+    // event coordination needed.
+    if (dst_is_cuda &&
+        ggml_backend_buffer_is_host(buf_src) &&
+        ggml_backend_buft_is_cuda_host(buf_src->buft)) {
+
+        ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend_dst->context;
+        ggml_backend_cuda_buffer_context * buf_ctx_dst = (ggml_backend_cuda_buffer_context *) buf_dst->context;
+        if (ctx->device != buf_ctx_dst->device) {
+            return false;
+        }
+
+        ggml_cuda_set_device(ctx->device);
+
+        CUDA_CHECK(cudaMemcpyAsync(
+            dst->data, src->data,
+            ggml_nbytes(src),
+            cudaMemcpyHostToDevice,
+            ctx->stream()));
+
+        return true;
+    }
+
+    // Anything else: not handled, caller falls back to sync.
+    return false;
+}
+
+// Parmesan: drain any pending async D2H copy whose destination is input_cpy.
+// Called by the scheduler before the consuming split's compute_async runs,
+// so the data is guaranteed ready when the consumer reads it.
+//
+// In steady state every entry is consumed within the same compute_splits
+// pass that produced it, so the map is small (≤ 1-2 entries during a
+// given moment of dispatch).
+static void ggml_backend_cuda_wait_input_ready(ggml_backend_t backend, struct ggml_tensor * input_cpy) {
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
+
+    if (input_cpy == nullptr || input_cpy->data == nullptr) {
+        return;
+    }
+
+    auto it = ctx->pending_d2h_events.find(input_cpy->data);
+    if (it == ctx->pending_d2h_events.end()) {
+        return;  // no pending copy for this input
+    }
+
+    cudaEvent_t event = it->second;
+    ctx->pending_d2h_events.erase(it);
+
+    // Block until the D2H completes. In practice this is ~0-10 us — the GPU
+    // copy engine has typically already finished by the time we get here,
+    // because the scheduler does other work between issuing the copy and
+    // calling this function.
+    CUDA_CHECK(cudaEventSynchronize(event));
+    ggml_backend_cuda_release_event(ctx, event);
 }
 
 static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
@@ -3083,6 +3303,82 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
 
     GGML_UNUSED(backend);
+}
+
+// Parmesan: lazy initialization of async copy stream and event pool.
+// Called from ggml_backend_cuda_cpy_tensor_async on the first cross-backend
+// copy that needs them. Safe to call multiple times — only allocates once.
+//
+// Returns true on success, false if any CUDA call fails (caller falls back
+// to the existing sync path). Logs the cause on failure.
+static bool ggml_backend_cuda_ensure_async_copy_resources(ggml_backend_cuda_context * ctx) {
+    if (ctx->async_copy_resources_ready) {
+        return true;
+    }
+
+    // Set the device explicitly — multi-GPU contexts are device-bound and
+    // cudaStreamCreate/cudaEventCreate honor the calling thread's current device.
+    ggml_cuda_set_device(ctx->device);
+
+    cudaError_t err = cudaStreamCreateWithFlags(&ctx->async_copy_stream, cudaStreamNonBlocking);
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+        GGML_LOG_WARN("%s: cudaStreamCreateWithFlags failed: %s — async copy disabled\n",
+                      __func__, cudaGetErrorString(err));
+        return false;
+    }
+
+    // Pre-allocate event pool. 128 is far above the per-decode peak (49
+    // splits × 1 input each = 49). Events are reusable: take on D2H queue,
+    // return on wait_input_ready sync.
+    constexpr int kEventPoolSize = 128;
+    ctx->async_event_pool.reserve(kEventPoolSize);
+    for (int i = 0; i < kEventPoolSize; ++i) {
+        cudaEvent_t event = nullptr;
+        // cudaEventDisableTiming: events are used purely for sync, not timing.
+        // This makes acquire/sync ~10× faster.
+        err = cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
+        if (err != cudaSuccess) {
+            (void) cudaGetLastError();
+            GGML_LOG_WARN("%s: cudaEventCreateWithFlags failed at %d/%d: %s — async copy disabled\n",
+                          __func__, i, kEventPoolSize, cudaGetErrorString(err));
+            // Free what we managed to allocate before bailing.
+            for (cudaEvent_t e : ctx->async_event_pool) {
+                cudaEventDestroy(e);
+            }
+            ctx->async_event_pool.clear();
+            cudaStreamDestroy(ctx->async_copy_stream);
+            ctx->async_copy_stream = nullptr;
+            return false;
+        }
+        ctx->async_event_pool.push_back(event);
+    }
+
+    ctx->async_copy_resources_ready = true;
+    GGML_LOG_INFO("%s: async copy stream + %d-event pool initialized for device %d\n",
+                  __func__, kEventPoolSize, ctx->device);
+    return true;
+}
+
+// Acquire one event from the pool. Returns nullptr on exhaustion (caller
+// must fall back to sync). The acquired event is in an undefined state and
+// will be re-recorded by the caller before use.
+static cudaEvent_t ggml_backend_cuda_acquire_event(ggml_backend_cuda_context * ctx) {
+    if (ctx->async_event_pool.empty()) {
+        GGML_LOG_WARN("%s: event pool exhausted (%zu pending d2h events) — async copy fallback\n",
+                      __func__, ctx->pending_d2h_events.size());
+        return nullptr;
+    }
+    cudaEvent_t event = ctx->async_event_pool.back();
+    ctx->async_event_pool.pop_back();
+    return event;
+}
+
+// Return an event to the pool after the consumer has synchronized on it.
+static void ggml_backend_cuda_release_event(ggml_backend_cuda_context * ctx, cudaEvent_t event) {
+    if (event != nullptr) {
+        ctx->async_event_pool.push_back(event);
+    }
 }
 
 #ifdef USE_CUDA_GRAPH
@@ -4559,6 +4855,7 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
     /* .graph_compute           = */ ggml_backend_cuda_graph_compute,
     /* .event_record            = */ ggml_backend_cuda_event_record,
     /* .event_wait              = */ ggml_backend_cuda_event_wait,
+    /* .wait_input_ready        = */ ggml_backend_cuda_wait_input_ready,
     /* .graph_optimize          = */ ggml_backend_cuda_graph_optimize,
 };
 
@@ -4569,6 +4866,18 @@ static ggml_guid_t ggml_backend_cuda_guid() {
 
 bool ggml_backend_is_cuda(ggml_backend_t backend) {
     return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_cuda_guid());
+}
+
+// Parmesan: see header comment. Returns the backend's default compute stream
+// as an opaque `void *` (really a `cudaStream_t`) so external code (e.g.,
+// MoE hot cache) can cudaStreamWaitEvent / record on it without pulling
+// cuda_runtime.h into its header dependencies.
+void * ggml_backend_cuda_get_stream(ggml_backend_t backend) {
+    if (backend == nullptr || !ggml_backend_is_cuda(backend)) {
+        return nullptr;
+    }
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    return (void *) cuda_ctx->stream();
 }
 
 int ggml_backend_cuda_get_device_count() {

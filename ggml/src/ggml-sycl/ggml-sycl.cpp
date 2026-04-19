@@ -4713,6 +4713,7 @@ static ggml_backend_i ggml_backend_sycl_interface = {
     /* .graph_compute           = */ ggml_backend_sycl_graph_compute,
     /* .event_record            = */ ggml_backend_sycl_event_record,
     /* .event_wait              = */ ggml_backend_sycl_event_wait,
+    /* .wait_input_ready        = */ NULL,
     /* .graph_optimize          = */ NULL,
 };
 

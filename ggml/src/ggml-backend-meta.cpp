@@ -2094,6 +2094,7 @@ static const ggml_backend_i ggml_backend_meta_i = {
     /* .graph_compute           = */ ggml_backend_meta_graph_compute,
     /* .event_record            = */ nullptr,
     /* .event_wait              = */ nullptr,
+    /* .wait_input_ready        = */ nullptr,
     /* .graph_optimize          = */ nullptr,
 };
 

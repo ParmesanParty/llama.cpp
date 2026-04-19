@@ -135,6 +135,24 @@ extern "C" {
         // wait for an event on on a different stream
         void (*event_wait)  (ggml_backend_t backend, ggml_backend_event_t event);
 
+        // (optional) wait for any pending async copies whose destination is the
+        // given input_cpy tensor. Backends that issued async cpy_tensor_async
+        // operations targeting this tensor must drain them here so the caller
+        // can safely read the data. No-op for backends without pending copies.
+        //
+        // Used by the scheduler to coordinate the host-side wait for async
+        // cross-backend copies (e.g., the CUDA backend's CUDA→pinned-host
+        // D2H path that runs on a dedicated copy stream and stashes the
+        // completion event in a per-context map). Without this hook, async
+        // copies would have no consumer-side synchronization point and the
+        // consumer's compute would race with the in-flight DMA.
+        //
+        // The function takes the input_cpy tensor (the destination of the
+        // async copy, allocated by the scheduler in the consuming backend's
+        // buffer) so the implementation can look it up in its pending-events
+        // table by host pointer.
+        void (*wait_input_ready)(ggml_backend_t backend, struct ggml_tensor * input_cpy);
+
         // (optional) sort/optimize the nodes in the graph
         void                      (*graph_optimize)    (ggml_backend_t backend, struct ggml_cgraph * cgraph);
     };
