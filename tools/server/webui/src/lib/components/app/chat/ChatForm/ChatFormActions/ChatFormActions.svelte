@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Square } from '@lucide/svelte';
+	import { Square, Brain } from '@lucide/svelte';
 	import { Button } from '$lib/components/ui/button';
 	import {
 		ChatFormActionsAdd,
@@ -10,7 +10,7 @@
 	import { FileTypeCategory } from '$lib/enums';
 	import { mcpStore } from '$lib/stores/mcp.svelte';
 	import { config } from '$lib/stores/settings.svelte';
-	import { conversationsStore } from '$lib/stores/conversations.svelte';
+	import { activeThinkingEnabled, conversationsStore } from '$lib/stores/conversations.svelte';
 	import { getFileTypeCategory } from '$lib/utils';
 	import { goto } from '$app/navigation';
 
@@ -88,8 +88,8 @@
 	class="flex w-full items-center gap-3 {className} {showAddButton ? '' : 'justify-end'}"
 	style="container-type: inline-size"
 >
-	{#if showAddButton}
-		<div class="mr-auto flex items-center gap-2">
+	<div class="mr-auto flex items-center gap-2">
+		{#if showAddButton}
 			<ChatFormActionsAdd
 				{disabled}
 				{hasAudioModality}
@@ -102,8 +102,19 @@
 				{onMcpResourcesClick}
 				onMcpSettingsClick={() => goto('#/settings/mcp')}
 			/>
-		</div>
-	{/if}
+		{/if}
+
+		<Button
+			variant="ghost"
+			size="icon"
+			onclick={() => conversationsStore.toggleThinking()}
+			class="h-8 w-8 rounded-full p-0"
+			{disabled}
+			title={activeThinkingEnabled() ? 'Thinking enabled' : 'Thinking disabled'}
+		>
+			<Brain class="h-4 w-4 {activeThinkingEnabled() ? 'text-primary' : 'text-muted-foreground'}" />
+		</Button>
+	</div>
 
 	{#if showModelSelector}
 		<ChatFormActionModels
