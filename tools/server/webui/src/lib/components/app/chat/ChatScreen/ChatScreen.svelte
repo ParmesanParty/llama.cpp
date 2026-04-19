@@ -346,69 +346,73 @@
 
 {#if !isEmpty}
 	<div
-		bind:this={chatScrollContainer}
-		aria-label="Chat interface with file drop zone"
-		class="flex h-full flex-col-reverse overflow-y-auto px-4 md:px-6"
+		class="flex h-full flex-col"
 		ondragenter={handleDragEnter}
 		ondragleave={handleDragLeave}
 		ondragover={handleDragOver}
 		ondrop={handleDrop}
-		onscroll={handleScroll}
-		role="main"
 	>
-		<div class="flex flex-col">
-			<ChatMessages
-				class="mb-16 md:mb-24"
-				messages={activeMessages()}
-				onUserAction={() => {
-					autoScroll.enable();
-					autoScroll.scrollToBottom();
-				}}
-			/>
+		<div
+			bind:this={chatScrollContainer}
+			aria-label="Chat interface with file drop zone"
+			class="flex min-h-0 flex-1 flex-col-reverse overflow-y-auto px-4 md:px-6"
+			onscroll={handleScroll}
+			role="main"
+		>
+			<div class="flex flex-col">
+				<ChatMessages
+					class="pb-4"
+					messages={activeMessages()}
+					onUserAction={() => {
+						autoScroll.enable();
+						autoScroll.scrollToBottom();
+					}}
+				/>
+			</div>
+		</div>
 
-			<div
-				class="pointer-events-none sticky right-0 bottom-4 left-0 mt-auto"
-				in:slide={{ duration: 150, axis: 'y' }}
-			>
-				<ChatScreenProcessingInfo />
+		<div
+			class="chat-form-area shrink-0 px-4 md:px-6"
+			in:slide={{ duration: 150, axis: 'y' }}
+		>
+			<ChatScreenProcessingInfo />
 
-				{#if hasPropsError}
-					<div
-						class="pointer-events-auto mx-auto mb-4 max-w-[48rem] px-1"
-						in:fly={{ y: 10, duration: 250 }}
-					>
-						<Alert.Root variant="destructive">
-							<AlertTriangle class="h-4 w-4" />
-							<Alert.Title class="flex items-center justify-between">
-								<span>Server unavailable</span>
-								<button
-									onclick={() => serverStore.fetch()}
-									disabled={isServerLoading}
-									class="flex items-center gap-1.5 rounded-lg bg-destructive/20 px-2 py-1 text-xs font-medium hover:bg-destructive/30 disabled:opacity-50"
-								>
-									<RefreshCw class="h-3 w-3 {isServerLoading ? 'animate-spin' : ''}" />
-									{isServerLoading ? 'Retrying...' : 'Retry'}
-								</button>
-							</Alert.Title>
-							<Alert.Description>{serverError()}</Alert.Description>
-						</Alert.Root>
-					</div>
-				{/if}
-
-				<div class="conversation-chat-form pointer-events-auto rounded-t-3xl">
-					<ChatScreenForm
-						disabled={hasPropsError || isEditing()}
-						{initialMessage}
-						isLoading={isCurrentConversationLoading}
-						onFileRemove={handleFileRemove}
-						onFileUpload={handleFileUpload}
-						onSend={handleSendMessage}
-						onStop={() => chatStore.stopGeneration()}
-						onSystemPromptAdd={handleSystemPromptAdd}
-						showHelperText={false}
-						bind:uploadedFiles
-					/>
+			{#if hasPropsError}
+				<div
+					class="mx-auto mb-4 max-w-[48rem] px-1"
+					in:fly={{ y: 10, duration: 250 }}
+				>
+					<Alert.Root variant="destructive">
+						<AlertTriangle class="h-4 w-4" />
+						<Alert.Title class="flex items-center justify-between">
+							<span>Server unavailable</span>
+							<button
+								onclick={() => serverStore.fetch()}
+								disabled={isServerLoading}
+								class="flex items-center gap-1.5 rounded-lg bg-destructive/20 px-2 py-1 text-xs font-medium hover:bg-destructive/30 disabled:opacity-50"
+							>
+								<RefreshCw class="h-3 w-3 {isServerLoading ? 'animate-spin' : ''}" />
+								{isServerLoading ? 'Retrying...' : 'Retry'}
+							</button>
+						</Alert.Title>
+						<Alert.Description>{serverError()}</Alert.Description>
+					</Alert.Root>
 				</div>
+			{/if}
+
+			<div class="conversation-chat-form rounded-t-3xl">
+				<ChatScreenForm
+					disabled={hasPropsError || isEditing()}
+					{initialMessage}
+					isLoading={isCurrentConversationLoading}
+					onFileRemove={handleFileRemove}
+					onFileUpload={handleFileUpload}
+					onSend={handleSendMessage}
+					onStop={() => chatStore.stopGeneration()}
+					onSystemPromptAdd={handleSystemPromptAdd}
+					showHelperText={false}
+					bind:uploadedFiles
+				/>
 			</div>
 		</div>
 	</div>
@@ -577,6 +581,22 @@
 />
 
 <style>
+	.chat-form-area {
+		position: relative;
+
+		&::before {
+			content: '';
+			position: absolute;
+			bottom: 100%;
+			left: 0;
+			right: 0;
+			height: 2.5rem;
+			background: linear-gradient(to top, var(--background), transparent);
+			pointer-events: none;
+			z-index: 10;
+		}
+	}
+
 	.conversation-chat-form {
 		position: relative;
 
