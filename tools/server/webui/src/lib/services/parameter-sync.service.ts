@@ -275,6 +275,16 @@ export class ParameterSyncService {
 	}
 
 	/**
+	 * Extract thinking-mode sampling overrides from /props response.
+	 * Returns the overrides dict or empty object if none.
+	 */
+	static extractThinkingOverrides(
+		propsResponse: ApiLlamaCppServerProps | null
+	): Record<string, number> {
+		return propsResponse?.thinking_overrides ?? {};
+	}
+
+	/**
 	 * Extract server default parameters that can be synced from `/props` response.
 	 * Handles both generation settings parameters and webui-specific settings.
 	 * Converts samplers array to semicolon-delimited string for UI display.
