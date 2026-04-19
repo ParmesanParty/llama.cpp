@@ -12,6 +12,7 @@ import type {
 	ApiChatCompletionToolCallDelta,
 	ApiChatMessageData,
 	ApiChatMessageContentPart,
+	ApiCompactionMetadata,
 	ApiContextSizeError,
 	ApiErrorResponse,
 	ApiLlamaCppServerProps,
@@ -36,6 +37,7 @@ import type {
 	ChatMessagePromptProgress,
 	ChatMessageTimings,
 	// Database types
+	ConversationCompaction,
 	DatabaseConversation,
 	DatabaseMessage,
 	DatabaseMessageExtra,
@@ -76,6 +78,7 @@ declare global {
 		ApiChatCompletionToolCallDelta,
 		ApiChatMessageData,
 		ApiChatMessageContentPart,
+		ApiCompactionMetadata,
 		ApiContextSizeError,
 		ApiErrorResponse,
 		ApiLlamaCppServerProps,
@@ -100,6 +103,7 @@ declare global {
 		ChatRole,
 		ChatUploadedFile,
 		// Database types
+		ConversationCompaction,
 		DatabaseConversation,
 		DatabaseMessage,
 		DatabaseMessageExtra,

@@ -6,6 +6,13 @@ export interface McpServerOverride {
 	enabled: boolean;
 }
 
+export interface ConversationCompaction {
+	summary: string;
+	compactedUpToMessageId: string;
+	compactedMessageCount: number;
+	timestamp: number;
+}
+
 export interface DatabaseConversation {
 	currNode: string | null;
 	id: string;
@@ -14,6 +21,7 @@ export interface DatabaseConversation {
 	mcpServerOverrides?: McpServerOverride[];
 	forkedFromConversationId?: string;
 	enableThinking?: boolean;
+	compaction?: ConversationCompaction;
 }
 
 export interface DatabaseMessageExtraAudioFile {

@@ -20,6 +20,7 @@ export type {
 	ApiChatCompletionToolCall,
 	ApiChatCompletionStreamChunk,
 	ApiChatCompletionResponse,
+	ApiCompactionMetadata,
 	ApiSlotData,
 	ApiProcessingState,
 	ApiRouterModelMeta,
@@ -53,6 +54,7 @@ export type {
 
 // Database types
 export type {
+	ConversationCompaction,
 	McpServerOverride,
 	DatabaseConversation,
 	DatabaseMessageExtraAudioFile,

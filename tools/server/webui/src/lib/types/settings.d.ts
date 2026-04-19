@@ -2,6 +2,7 @@ import type { SETTING_CONFIG_DEFAULT } from '$lib/constants';
 import type { ChatMessagePromptProgress, ChatMessageTimings } from './chat';
 import type { OpenAIToolDefinition } from './mcp';
 import type { DatabaseMessageExtra } from './database';
+import type { ApiCompactionMetadata } from './api';
 import type { ParameterSource, SyncableParameterType, SettingsFieldType } from '$lib/enums';
 import type { Icon } from '@lucide/svelte';
 
@@ -70,6 +71,7 @@ export interface SettingsChatServiceOptions {
 		toolCalls?: string
 	) => void;
 	onError?: (error: Error) => void;
+	onCompaction?: (metadata: ApiCompactionMetadata) => void;
 }
 
 export type SettingsConfigType = typeof SETTING_CONFIG_DEFAULT & {

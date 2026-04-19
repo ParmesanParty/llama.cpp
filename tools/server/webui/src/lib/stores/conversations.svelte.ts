@@ -29,7 +29,7 @@ import {
 	runLegacyMigration,
 	generateConversationTitle
 } from '$lib/utils';
-import type { McpServerOverride } from '$lib/types/database';
+import type { McpServerOverride, ConversationCompaction } from '$lib/types/database';
 import { MessageRole } from '$lib/enums';
 import {
 	ISO_DATE_TIME_SEPARATOR,
@@ -426,6 +426,26 @@ class ConversationsStore {
 	 */
 	async getConversationMessages(convId: string): Promise<DatabaseMessage[]> {
 		return await DatabaseService.getConversationMessages(convId);
+	}
+
+	/**
+	 * Sets compaction state on the active conversation.
+	 */
+	async setCompaction(compaction: ConversationCompaction): Promise<void> {
+		if (!this.activeConversation) return;
+		this.activeConversation = { ...this.activeConversation, compaction };
+		await DatabaseService.updateConversation(this.activeConversation.id, { compaction });
+	}
+
+	/**
+	 * Clears compaction state on the active conversation.
+	 */
+	async clearCompaction(): Promise<void> {
+		if (!this.activeConversation) return;
+		this.activeConversation = { ...this.activeConversation, compaction: undefined };
+		await DatabaseService.updateConversation(this.activeConversation.id, {
+			compaction: undefined
+		});
 	}
 
 	/**

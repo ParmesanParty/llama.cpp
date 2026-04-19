@@ -258,6 +258,12 @@ export interface ApiChatCompletionToolCall extends ApiChatCompletionToolCallDelt
 	function?: ApiChatCompletionToolCallFunctionDelta & { arguments?: string };
 }
 
+export interface ApiCompactionMetadata {
+	summary: string;
+	compacted_message_count: number;
+	compacted_up_to_index: number;
+}
+
 export interface ApiChatCompletionStreamChunk {
 	object?: string;
 	model?: string;
@@ -280,6 +286,7 @@ export interface ApiChatCompletionStreamChunk {
 		cache_n?: number;
 	};
 	prompt_progress?: ChatMessagePromptProgress;
+	compaction?: ApiCompactionMetadata;
 }
 
 export interface ApiChatCompletionResponse {
@@ -295,6 +302,7 @@ export interface ApiChatCompletionResponse {
 		};
 		finish_reason?: string | null;
 	}>;
+	compaction?: ApiCompactionMetadata;
 }
 
 export interface ApiSlotData {

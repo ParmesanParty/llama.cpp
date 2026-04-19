@@ -124,6 +124,7 @@ export interface ChatStreamCallbacks {
 	onFlowComplete?: (timings?: ChatMessageTimings) => void;
 	onError?: (error: Error) => void;
 	onTurnComplete?: (intermediateTimings: ChatMessageTimings) => void;
+	onCompaction?: (metadata: ApiCompactionMetadata) => void;
 }
 
 /**
