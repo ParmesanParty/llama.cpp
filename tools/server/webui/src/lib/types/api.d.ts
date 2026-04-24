@@ -294,6 +294,30 @@ export interface ApiToolHealthEvent {
 	reason: string;
 }
 
+export interface ApiToolArtifactPayload {
+	/** Discriminator. Currently only "image"; "file" reserved for future use. */
+	kind: 'image' | 'file';
+	/** Display name + img alt text — used as the rehype-resolution key against attachment names. */
+	name: string;
+	/** MIME type, e.g. "image/png". */
+	mime: string;
+	/** Bare base64 payload (no `data:` prefix). The client wraps this in a data URL. */
+	data_b64: string;
+	/** Optional pixel width hint (server-side PIL probe). */
+	width?: number;
+	/** Optional pixel height hint (server-side PIL probe). */
+	height?: number;
+	/** Optional diagnostic URL the proxy serves the artifact from, e.g. "/images/code-exec-...png". */
+	url?: string;
+}
+
+export interface ApiToolArtifactsEvent {
+	tool: string;
+	call_id: string;
+	iteration: number;
+	artifact: ApiToolArtifactPayload;
+}
+
 export interface ApiChatCompletionStreamChunk {
 	object?: string;
 	model?: string;
