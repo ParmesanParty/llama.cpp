@@ -194,6 +194,7 @@ export interface ToolChip {
 	status: string;
 	query?: string;
 	call_id?: string;
+	artifacts?: ApiToolArtifactPayload[];
 }
 
 export interface ToolStep {
