@@ -6,7 +6,7 @@
 	import { MarkdownContent } from '$lib/components/app';
 	import { LEGACY_REASONING_TAGS as REASONING_TAGS, REASONING_BOUNDARY } from '$lib/constants';
 	import { config } from '$lib/stores/settings.svelte';
-	import type { StreamEvent, DatabaseMessageExtra } from '$lib/types';
+	import type { StreamEvent, DatabaseMessageExtra, ApiToolArtifactPayload } from '$lib/types';
 	import type { SourceItem, ToolStep } from '$lib/types/chat';
 
 	interface Props {
@@ -143,6 +143,18 @@
 			groups.set(iter, existing);
 		}
 
+		// Build artifact map keyed by call_id (one entry per tool call).
+		// Each tool_artifacts SSE event carries a single artifact; multiple
+		// events for the same call_id accumulate into the chip's array.
+		const artifactMap = new Map<string, ApiToolArtifactPayload[]>();
+		for (const event of streamEvents) {
+			if (event.type !== 'tool_artifacts') continue;
+			const data = event.data as { call_id?: string; artifact?: ApiToolArtifactPayload };
+			if (!data.call_id || !data.artifact) continue;
+			const existing = artifactMap.get(data.call_id) ?? [];
+			artifactMap.set(data.call_id, [...existing, data.artifact]);
+		}
+
 		const iterations = [...groups.keys()].sort((a, b) => a - b);
 		return iterations.map((iter, i) => {
 			const events = groups.get(iter)!;
@@ -168,7 +180,8 @@
 					tool: info.tool,
 					status: info.status,
 					query: info.query,
-					call_id: key
+					call_id: key,
+					artifacts: artifactMap.get(key)
 				}))
 			};
 		});
