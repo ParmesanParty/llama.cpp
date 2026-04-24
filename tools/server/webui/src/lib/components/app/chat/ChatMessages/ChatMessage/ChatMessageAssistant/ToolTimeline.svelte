@@ -101,6 +101,7 @@
           query={chip.query}
           expanded={isChipExpanded(i, chip)}
           onToggleExpand={() => toggleChip(i, chip)}
+          artifacts={chip.artifacts}
         />
       {/each}
     </div>

@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { Search, Cloud, Code, Image, Globe } from '@lucide/svelte';
+	import type { ApiToolArtifactPayload } from '$lib/types';
 
 	interface Props {
 		tool: string;
@@ -7,9 +8,10 @@
 		query?: string;
 		expanded?: boolean;
 		onToggleExpand?: () => void;
+		artifacts?: ApiToolArtifactPayload[];
 	}
 
-	let { tool, status, query, expanded = false, onToggleExpand }: Props = $props();
+	let { tool, status, query, expanded = false, onToggleExpand, artifacts }: Props = $props();
 
 	const iconMap: Record<string, typeof Search> = {
 		web_search: Search,
@@ -38,6 +40,9 @@
 	);
 	let isExecuting = $derived(status === 'executing');
 	let isClickable = $derived(!!query && !!onToggleExpand);
+	let imageArtifacts = $derived(
+		(artifacts ?? []).filter((a) => a.kind === 'image')
+	);
 
 	function handleClick() {
 		if (!isClickable) return;
@@ -47,30 +52,62 @@
 	}
 </script>
 
-<!-- svelte-ignore a11y_no_static_element_interactions -->
-<span
-	class="tool-chip"
-	class:clickable={isClickable}
-	class:expanded
-	title={query || ''}
-	onclick={handleClick}
-	onkeydown={(e) => { if (isClickable && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); onToggleExpand?.(); } }}
-	role={isClickable ? 'button' : undefined}
-	tabindex={isClickable ? 0 : undefined}
->
+<div class="tool-chip-wrapper">
+	<!-- svelte-ignore a11y_no_static_element_interactions -->
 	<span
-		class="tool-chip-dot"
-		class:executing={isExecuting}
-		style:background-color={statusColor}
-	></span>
-	<IconComponent class="tool-chip-icon" size={14} />
-	<span class="tool-chip-label">{label}</span>
-	{#if query}
-		<span class="tool-chip-query" class:query-expanded={expanded}>{query}</span>
+		class="tool-chip"
+		class:clickable={isClickable}
+		class:expanded
+		title={query || ''}
+		onclick={handleClick}
+		onkeydown={(e) => { if (isClickable && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); onToggleExpand?.(); } }}
+		role={isClickable ? 'button' : undefined}
+		tabindex={isClickable ? 0 : undefined}
+	>
+		<span
+			class="tool-chip-dot"
+			class:executing={isExecuting}
+			style:background-color={statusColor}
+		></span>
+		<IconComponent class="tool-chip-icon" size={14} />
+		<span class="tool-chip-label">{label}</span>
+		{#if query}
+			<span class="tool-chip-query" class:query-expanded={expanded}>{query}</span>
+		{/if}
+	</span>
+
+	{#if imageArtifacts.length}
+		<div class="tool-chip-artifacts">
+			{#each imageArtifacts as artifact (artifact.name)}
+				{@const src = artifact.url ?? `data:${artifact.mime};base64,${artifact.data_b64}`}
+				<a
+					href={src}
+					target="_blank"
+					rel="noopener noreferrer"
+					class="artifact-link"
+					aria-label="Open {artifact.name} in new tab"
+				>
+					<img
+						{src}
+						alt={artifact.name}
+						class="artifact-thumb"
+						loading="lazy"
+					/>
+				</a>
+			{/each}
+		</div>
 	{/if}
-</span>
+</div>
 
 <style>
+	.tool-chip-wrapper {
+		display: flex;
+		flex-direction: column;
+		align-items: flex-start;
+		gap: 0.375rem;
+		flex-basis: auto;
+	}
+
 	.tool-chip {
 		display: inline-flex;
 		align-items: center;
@@ -136,6 +173,35 @@
 
 	.tool-chip-dot.executing {
 		animation: pulse 1.5s ease-in-out infinite;
+	}
+
+	.tool-chip-artifacts {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.5rem;
+		margin: 0 0 0.25rem 0.25rem;
+	}
+
+	.artifact-link {
+		display: inline-block;
+		line-height: 0;
+		border-radius: 0.5rem;
+		overflow: hidden;
+		border: 1px solid var(--muted);
+		transition: border-color 150ms ease;
+	}
+
+	.artifact-link:hover {
+		border-color: color-mix(in oklch, var(--muted) 50%, var(--foreground) 15%);
+	}
+
+	.artifact-thumb {
+		display: block;
+		max-width: 280px;
+		max-height: 280px;
+		width: auto;
+		height: auto;
+		object-fit: contain;
 	}
 
 	@keyframes pulse {
