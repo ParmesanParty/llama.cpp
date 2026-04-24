@@ -56,7 +56,7 @@ export const REASONING_BOUNDARY = '\n<<<reasoning_boundary>>>\n';
  * Opts the client into typed SSE events from the proxy orchestrator.
  */
 export const STREAM_FEATURE_TOKENS = [
-	'tool-status', 'retraction', 'compaction', 'sources', 'tool-health'
+	'tool-status', 'retraction', 'compaction', 'sources', 'tool-health', 'tool-artifacts'
 ] as const;
 
 // Regex for trimming leading/trailing newlines

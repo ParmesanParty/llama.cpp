@@ -21,7 +21,8 @@ import type {
 	ApiToolStatusEvent,
 	ApiRetractionEvent,
 	ApiSourcesEvent,
-	ApiToolHealthEvent
+	ApiToolHealthEvent,
+	ApiToolArtifactsEvent
 } from '$lib/types/api';
 import type { DatabaseMessageExtraMcpPrompt, DatabaseMessageExtraMcpResource } from '$lib/types';
 import { modelsStore } from '$lib/stores/models.svelte';
@@ -105,6 +106,7 @@ export class ChatService {
 			onRetraction,
 			onSources,
 			onToolHealth,
+			onToolArtifacts,
 			// Tools for function calling
 			tools,
 			// Generation parameters
@@ -291,7 +293,8 @@ export class ChatService {
 						onToolStatus,
 						onRetraction,
 						onSources,
-						onToolHealth
+						onToolHealth,
+						onToolArtifacts
 					},
 					signal
 				);
@@ -483,6 +486,7 @@ export class ChatService {
 			onRetraction?: (event: ApiRetractionEvent) => void;
 			onSources?: (event: ApiSourcesEvent) => void;
 			onToolHealth?: (event: ApiToolHealthEvent) => void;
+			onToolArtifacts?: (event: ApiToolArtifactsEvent) => void;
 		},
 		abortSignal?: AbortSignal
 	): Promise<void> {
@@ -498,7 +502,8 @@ export class ChatService {
 			onToolStatus,
 			onRetraction,
 			onSources,
-			onToolHealth
+			onToolHealth,
+			onToolArtifacts
 		} = callbacks;
 
 		const reader = response.body?.getReader();
@@ -578,6 +583,9 @@ export class ChatService {
 						break;
 					case 'tool_health':
 						onToolHealth?.(payload as ApiToolHealthEvent);
+						break;
+					case 'tool_artifacts':
+						onToolArtifacts?.(payload as ApiToolArtifactsEvent);
 						break;
 					default:
 						if (import.meta.env.DEV) {
