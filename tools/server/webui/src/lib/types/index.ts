@@ -25,6 +25,8 @@ export type {
 	ApiRetractionEvent,
 	ApiSourcesEvent,
 	ApiToolHealthEvent,
+	ApiToolArtifactsEvent,
+	ApiToolArtifactPayload,
 	ApiSlotData,
 	ApiProcessingState,
 	ApiRouterModelMeta,

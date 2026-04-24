@@ -11,6 +11,7 @@ import type {
 	ApiRetractionEvent,
 	ApiSourcesEvent,
 	ApiToolHealthEvent,
+	ApiToolArtifactsEvent,
 	ApiCompactionMetadata,
 	StreamEvent,
 	DatabaseMessage,
@@ -87,6 +88,13 @@ export function createStreamEventHandlers(ctx: StreamEventContext) {
 			console.warn(
 				`[tool-health] ${event.tool}: ${event.state} — ${event.reason}`
 			);
+		},
+		onToolArtifacts: (event: ApiToolArtifactsEvent) => {
+			pushEvent({
+				type: 'tool_artifacts',
+				offset: 0,
+				data: event as unknown as Record<string, unknown>
+			});
 		},
 		onCompaction: (metadata: ApiCompactionMetadata) => {
 			const msgs = ctx.sentMessages() ?? ctx.activeMessages();
