@@ -101,6 +101,12 @@
 		height={imageHeight}
 		width={imageWidth}
 		{imageClass}
+		pixelWidth={item.attachment?.type === AttachmentType.IMAGE
+			? item.attachment.width
+			: undefined}
+		pixelHeight={item.attachment?.type === AttachmentType.IMAGE
+			? item.attachment.height
+			: undefined}
 		onclick={() => onPreview?.(item)}
 	/>
 {:else if isPdfFile(item.attachment, item.uploadedFile)}
