@@ -19,6 +19,7 @@
 			size="icon-lg"
 			onclick={() => chatSettingsDialog.open()}
 			class="rounded-full backdrop-blur-lg"
+			aria-label="Open settings"
 		>
 			<Settings class="h-4 w-4" />
 		</Button>
