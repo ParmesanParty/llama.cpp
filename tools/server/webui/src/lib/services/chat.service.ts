@@ -397,7 +397,11 @@ export class ChatService {
 		messages: ApiChatMessageData[] | (DatabaseMessage & { extra?: DatabaseMessageExtra[] })[],
 		model?: string | null,
 		excludeReasoning?: boolean,
-		signal?: AbortSignal
+		signal?: AbortSignal,
+		enableThinking?: boolean,
+		preserveThinking?: boolean,
+		thinkingOverrides?: Record<string, number>,
+		custom?: string | Record<string, unknown>
 	): Promise<void> {
 		const normalizedMessages: ApiChatMessageData[] = messages
 			.map((msg) => {
@@ -438,8 +442,24 @@ export class ChatService {
 			n_predict: 0
 		};
 
-		if (model) {
-			requestBody.model = model;
+		if (model) requestBody.model = model;
+		if (enableThinking !== undefined) requestBody.enable_thinking = enableThinking;
+		if (preserveThinking !== undefined) requestBody.preserve_thinking = preserveThinking;
+		if (enableThinking && thinkingOverrides) {
+			for (const [param, value] of Object.entries(thinkingOverrides)) {
+				requestBody[param] = value;
+			}
+		}
+
+		// Mirror sendMessage: merge user-set custom params LAST so they win
+		// over thinking-mode overrides if both target the same key.
+		if (custom) {
+			try {
+				const customParams = typeof custom === 'string' ? JSON.parse(custom) : custom;
+				Object.assign(requestBody, customParams);
+			} catch (error) {
+				console.warn('Failed to parse custom parameters:', error);
+			}
 		}
 
 		try {
