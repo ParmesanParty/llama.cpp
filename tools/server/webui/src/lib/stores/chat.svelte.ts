@@ -637,6 +637,18 @@ class ChatStore {
 		this.setActiveProcessingConversation(convId);
 		const abortController = this.getOrCreateAbortController(convId);
 
+		// Shared between streamCallbacks (for ChatService.sendMessage) and
+		// createStreamEventHandlers (for the SSE-routed tool_artifacts handler).
+		const onAttachmentsHandler = (messageId: string, extras: DatabaseMessageExtra[]) => {
+			if (!extras.length) return;
+			const idx = conversationsStore.findMessageIndex(messageId);
+			if (idx === -1) return;
+			const msg = conversationsStore.activeMessages[idx];
+			const updatedExtras = [...(msg.extra || []), ...extras];
+			conversationsStore.updateMessageAtIndex(idx, { extra: updatedExtras });
+			DatabaseService.updateMessage(messageId, { extra: updatedExtras }).catch(console.error);
+		};
+
 		const streamCallbacks: ChatStreamCallbacks = {
 			onChunk: (chunk: string) => {
 				streamedContent += chunk;
@@ -654,15 +666,7 @@ class ChatStore {
 				const idx = conversationsStore.findMessageIndex(currentMessageId);
 				conversationsStore.updateMessageAtIndex(idx, { toolCalls: JSON.stringify(toolCalls) });
 			},
-			onAttachments: (messageId: string, extras: DatabaseMessageExtra[]) => {
-				if (!extras.length) return;
-				const idx = conversationsStore.findMessageIndex(messageId);
-				if (idx === -1) return;
-				const msg = conversationsStore.activeMessages[idx];
-				const updatedExtras = [...(msg.extra || []), ...extras];
-				conversationsStore.updateMessageAtIndex(idx, { extra: updatedExtras });
-				DatabaseService.updateMessage(messageId, { extra: updatedExtras }).catch(console.error);
-			},
+			onAttachments: onAttachmentsHandler,
 			onModel: (modelName: string) => recordModel(modelName),
 			onTurnComplete: (intermediateTimings: ChatMessageTimings) => {
 				// Update the first assistant message with cumulative agentic timings
@@ -821,7 +825,8 @@ class ChatStore {
 				sentMessages: () => sentMessages,
 				activeMessages: () => conversationsStore.activeMessages,
 				activeConversation: () => conversationsStore.activeConversation,
-				setCompaction: (c) => conversationsStore.setCompaction(c)
+				setCompaction: (c) => conversationsStore.setCompaction(c),
+				onAttachments: onAttachmentsHandler
 			})
 		};
 

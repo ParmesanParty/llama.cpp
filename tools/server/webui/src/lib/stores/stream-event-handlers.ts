@@ -6,6 +6,7 @@
  * avoid O(n²) array copies when many events arrive in a single frame.
  */
 
+import { AttachmentType } from '$lib/enums';
 import type {
 	ApiToolStatusEvent,
 	ApiRetractionEvent,
@@ -15,6 +16,8 @@ import type {
 	ApiCompactionMetadata,
 	StreamEvent,
 	DatabaseMessage,
+	DatabaseMessageExtra,
+	DatabaseMessageExtraImageFile,
 	ConversationCompaction
 } from '$lib/types';
 
@@ -31,6 +34,7 @@ export interface StreamEventContext {
 	activeMessages: () => DatabaseMessage[];
 	activeConversation: () => { id: string } | null;
 	setCompaction: (compaction: ConversationCompaction) => void;
+	onAttachments?: (messageId: string, extras: DatabaseMessageExtra[]) => void;
 }
 
 /**
@@ -90,11 +94,28 @@ export function createStreamEventHandlers(ctx: StreamEventContext) {
 			);
 		},
 		onToolArtifacts: (event: ApiToolArtifactsEvent) => {
+			// (1) Keep the raw event in streamEvents for tool-panel history / debug rendering.
 			pushEvent({
 				type: 'tool_artifacts',
 				offset: 0,
 				data: event as unknown as Record<string, unknown>
 			});
+
+			// (2) Promote image artifacts into message.extra so the message-level
+			// artifact row picks them up and inline markdown can resolve to the
+			// base64 payload. Non-image kinds short-circuit (future kinds land
+			// in separate PRs).
+			if (event.artifact.kind !== 'image') return;
+			const a = event.artifact;
+			const extra: DatabaseMessageExtraImageFile = {
+				type: AttachmentType.IMAGE,
+				name: a.name,
+				base64Url: `data:${a.mime};base64,${a.data_b64}`,
+				...(a.width !== undefined ? { width: a.width } : {}),
+				...(a.height !== undefined ? { height: a.height } : {}),
+				...(a.url !== undefined ? { url: a.url } : {})
+			};
+			ctx.onAttachments?.(ctx.assistantMessageId, [extra]);
 		},
 		onCompaction: (metadata: ApiCompactionMetadata) => {
 			const msgs = ctx.sentMessages() ?? ctx.activeMessages();
