@@ -261,9 +261,17 @@ export class ChatService {
 		}
 
 		try {
+			const headers: Record<string, string> = stream ? getStreamHeaders() : getJsonHeaders();
+			if (conversationId) {
+				// Server-side code_exec keys its kernel pool by this header so
+				// variables/imports persist across tool calls in the same
+				// conversation. Without it, every code_exec call gets a fresh
+				// ephemeral kernel and loses state.
+				headers['X-Code-Exec-Session'] = conversationId;
+			}
 			const response = await fetch(`./v1/chat/completions`, {
 				method: 'POST',
-				headers: stream ? getStreamHeaders() : getJsonHeaders(),
+				headers,
 				body: JSON.stringify(requestBody),
 				signal
 			});
