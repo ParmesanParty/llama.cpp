@@ -36,6 +36,9 @@ export interface DatabaseMessageExtraImageFile {
 	type: AttachmentType.IMAGE;
 	name: string;
 	base64Url: string;
+	width?: number;
+	height?: number;
+	url?: string;
 }
 
 /**
