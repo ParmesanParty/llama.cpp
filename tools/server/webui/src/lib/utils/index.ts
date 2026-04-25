@@ -15,6 +15,7 @@ export { validateApiKey } from './api-key-validation';
 // Attachment utilities
 export { getAttachmentDisplayItems } from './attachment-display';
 export { isTextFile, isImageFile, isPdfFile, isAudioFile } from './attachment-type';
+export { resolveInlineImageSrcs } from './resolve-inline-image-srcs';
 
 // Textarea utilities
 export { default as autoResizeTextarea } from './autoresize-textarea';

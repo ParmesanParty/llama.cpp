@@ -1,5 +1,6 @@
 <script lang="ts">
 	import {
+		ChatAttachmentsList,
 		ChatMessageAgenticContent,
 		ChatMessageActions,
 		ChatMessageStatistics,
@@ -14,9 +15,11 @@
 		autoResizeTextarea,
 		copyToClipboard,
 		isIMEComposing,
-		deriveAgenticSections
+		deriveAgenticSections,
+		resolveInlineImageSrcs
 	} from '$lib/utils';
-	import { AgenticSectionType } from '$lib/enums';
+	import { AgenticSectionType, AttachmentType } from '$lib/enums';
+	import type { DatabaseMessageExtra } from '$lib/types';
 	import { REASONING_TAGS } from '$lib/constants/agentic';
 	import { tick } from 'svelte';
 	import { fade } from 'svelte/transition';
@@ -103,6 +106,23 @@
 	);
 	const hasRetractionMarker = $derived(messageContent?.includes(RETRACTION_TAG) ?? false);
 	const processingState = useProcessingState();
+
+	// Message-level artifact row: image attachments not already rendered
+	// inline via markdown image refs in the message content. The dedup
+	// utility resolves both name-based refs (against attachment.base64Url)
+	// and literal-URL refs (against attachment.url) so an artifact echoed
+	// inline by the model isn't shown twice.
+	const rowExtras = $derived.by(() => {
+		const extras = message.extra ?? [];
+		if (extras.length === 0) return [] as DatabaseMessageExtra[];
+		const inlineSrcs = resolveInlineImageSrcs(messageContent ?? '', extras);
+		return extras.filter((a: DatabaseMessageExtra) => {
+			if (a.type !== AttachmentType.IMAGE) return true;
+			if (inlineSrcs.has(a.base64Url)) return false;
+			if (a.url && inlineSrcs.has(a.url)) return false;
+			return true;
+		});
+	});
 
 	let currentConfig = $derived(config());
 	let isRouter = $derived(isRouterMode());
@@ -323,6 +343,17 @@
 				isStreaming={isChatStreaming()}
 				highlightTurns={highlightAgenticTurns}
 			/>
+		{/if}
+
+		{#if rowExtras.length > 0}
+			<div class="mt-3 mb-2" data-testid="assistant-artifact-row">
+				<ChatAttachmentsList
+					attachments={rowExtras}
+					readonly
+					limitToSingleRow
+					imageHeight="h-40"
+				/>
+			</div>
 		{/if}
 	{:else}
 		<div class="text-sm whitespace-pre-wrap">
