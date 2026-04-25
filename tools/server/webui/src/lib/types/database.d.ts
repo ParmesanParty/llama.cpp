@@ -28,6 +28,9 @@ export interface DatabaseMessageExtraImageFile {
 	name: string;
 	size?: number;
 	base64Url: string;
+	width?: number;
+	height?: number;
+	url?: string;
 }
 
 /**
