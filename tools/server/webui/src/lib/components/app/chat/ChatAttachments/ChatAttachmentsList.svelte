@@ -158,6 +158,12 @@
 							height={imageHeight}
 							width={imageWidth}
 							{imageClass}
+							pixelWidth={item.attachment?.type === AttachmentType.IMAGE
+								? item.attachment.width
+								: undefined}
+							pixelHeight={item.attachment?.type === AttachmentType.IMAGE
+								? item.attachment.height
+								: undefined}
 							onClick={(event) => openPreview(item, event)}
 						/>
 					{:else}
