@@ -16,6 +16,7 @@
 	import { isRouterMode, serverStore } from '$lib/stores/server.svelte';
 	import { EventsService } from '$lib/services';
 	import { config, settingsStore } from '$lib/stores/settings.svelte';
+	import { toolHealthStore } from '$lib/stores/toolHealth.svelte';
 	import { ModeWatcher } from 'mode-watcher';
 	import { Toaster } from 'svelte-sonner';
 	import { goto } from '$app/navigation';
@@ -149,6 +150,7 @@
 	$effect(() => {
 		if (browser) {
 			untrack(() => {
+				toolHealthStore.fetchSnapshot();
 				EventsService.connect();
 			});
 			return () => EventsService.disconnect();
