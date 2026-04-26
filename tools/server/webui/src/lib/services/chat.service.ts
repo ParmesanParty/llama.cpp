@@ -25,6 +25,9 @@ import type {
 } from '$lib/types/api';
 import type { DatabaseMessageExtraMcpPrompt, DatabaseMessageExtraMcpResource } from '$lib/types';
 import { modelsStore } from '$lib/stores/models.svelte';
+import { mcpStore } from '$lib/stores/mcp.svelte';
+import { mergedOrchestrationStore } from '$lib/stores/merged-orchestration.svelte';
+import { base } from '$app/paths';
 
 export class ChatService {
 	/**
@@ -266,6 +269,14 @@ export class ChatService {
 				// conversation. Without it, every code_exec call gets a fresh
 				// ephemeral kernel and loses state.
 				headers['X-Code-Exec-Session'] = conversationId;
+			}
+			// Merged orchestration: include session_id in body and X-Session-Token header
+			// when the proxy advertised the capability and the session was registered.
+			const moSessionId = mergedOrchestrationStore.sessionId;
+			const moSessionToken = mergedOrchestrationStore.sessionToken;
+			if (moSessionId && moSessionToken) {
+				(requestBody as Record<string, unknown>).session_id = moSessionId;
+				headers['X-Session-Token'] = moSessionToken;
 			}
 			const response = await fetch(`./v1/chat/completions`, {
 				method: 'POST',
@@ -607,6 +618,18 @@ export class ChatService {
 					case 'tool_artifacts':
 						onToolArtifacts?.(payload as ApiToolArtifactsEvent);
 						break;
+					case 'tool-execute':
+						void handleToolExecuteEvent(payload as {
+							correlation_id: string;
+							name: string;
+							server_alias: string;
+							tool_name_local: string;
+							args: Record<string, unknown>;
+						});
+						break;
+					case 'tool-execute-cancel':
+						handleToolExecuteCancelEvent(payload as { correlation_id: string });
+						break;
 					default:
 						if (import.meta.env.DEV) {
 							console.warn('[ChatService] Unknown SSE event type:', eventType);
@@ -615,6 +638,68 @@ export class ChatService {
 			} catch (e) {
 				console.error('[ChatService] Error parsing typed SSE event:', eventType, e);
 			}
+		};
+
+		const handleToolExecuteEvent = async (data: {
+			correlation_id: string;
+			name: string;
+			server_alias: string;
+			tool_name_local: string;
+			args: Record<string, unknown>;
+		}): Promise<void> => {
+			const sid = mergedOrchestrationStore.sessionId;
+			const token = mergedOrchestrationStore.sessionToken;
+			if (!sid || !token) {
+				console.warn('[ChatService] tool-execute received but no session registered');
+				return;
+			}
+			const startedAt = performance.now();
+			let body: {
+				ok: boolean;
+				content: string;
+				sources: unknown[];
+				artifacts: unknown[];
+				error_code: string | null;
+				client_latency_ms: number;
+			};
+			try {
+				const result = await mcpStore.executeToolByName(data.tool_name_local, data.args);
+				body = {
+					ok: !result.isError,
+					content: result.content,
+					sources: [],
+					artifacts: [],
+					error_code: result.isError ? 'tool_error' : null,
+					client_latency_ms: Math.round(performance.now() - startedAt),
+				};
+			} catch (e) {
+				console.warn('[ChatService] tool-execute dispatch failed', e);
+				body = {
+					ok: false,
+					content: '',
+					sources: [],
+					artifacts: [],
+					error_code: 'tool_error',
+					client_latency_ms: Math.round(performance.now() - startedAt),
+				};
+			}
+			try {
+				await fetch(`${base}/api/tool-callback/${sid}/${data.correlation_id}`, {
+					method: 'POST',
+					headers: {
+						'Content-Type': 'application/json',
+						'X-Session-Token': token,
+					},
+					body: JSON.stringify(body),
+				});
+			} catch (e) {
+				console.warn('[ChatService] tool-callback POST failed', e);
+			}
+		};
+
+		const handleToolExecuteCancelEvent = (data: { correlation_id: string }): void => {
+			// Phase 1: log only. Phase 2 wires AbortSignal propagation.
+			console.info('[ChatService] tool-execute-cancel', data.correlation_id);
 		};
 
 		try {
