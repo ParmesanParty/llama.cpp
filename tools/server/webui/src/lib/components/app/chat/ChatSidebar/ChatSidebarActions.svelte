@@ -1,11 +1,12 @@
 <script lang="ts">
-	import { Search, SquarePen, X } from '@lucide/svelte';
-	import { KeyboardShortcutInfo } from '$lib/components/app';
+	import { Search, SquarePen, X, Wrench } from '@lucide/svelte';
+	import { KeyboardShortcutInfo, ToolHealthBadge } from '$lib/components/app';
 	import { Button } from '$lib/components/ui/button';
 	import { Input } from '$lib/components/ui/input';
 	import { McpLogo } from '$lib/components/app';
 	import { SETTINGS_SECTION_TITLES } from '$lib/constants';
 	import { getChatSettingsDialogContext } from '$lib/contexts';
+	import { toolHealthStore } from '$lib/stores/toolHealth.svelte';
 
 	interface Props {
 		handleMobileSidebarItemClick: () => void;
@@ -97,6 +98,26 @@
 
 				MCP Servers
 			</div>
+		</Button>
+
+		<Button
+			class="w-full justify-between backdrop-blur-none! hover:[&>kbd]:opacity-100"
+			onclick={() => {
+				chatSettingsDialog.open(SETTINGS_SECTION_TITLES.TOOLS);
+				handleMobileSidebarItemClick();
+			}}
+			variant="ghost"
+		>
+			<div class="flex items-center gap-2">
+				<Wrench class="h-4 w-4" />
+
+				Tools
+			</div>
+
+			<ToolHealthBadge
+				color={toolHealthStore.badgeColor}
+				title={toolHealthStore.badgeTooltip}
+			/>
 		</Button>
 	{/if}
 </div>
