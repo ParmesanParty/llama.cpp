@@ -22,6 +22,7 @@
 	import { goto } from '$app/navigation';
 	import { modelsStore } from '$lib/stores/models.svelte';
 	import { mcpStore } from '$lib/stores/mcp.svelte';
+	import { mergedOrchestrationStore } from '$lib/stores/merged-orchestration.svelte';
 	import { TOOLTIP_DELAY_DURATION } from '$lib/constants';
 	import type { SettingsSectionTitle } from '$lib/constants';
 	import { KeyboardKey } from '$lib/enums';
@@ -203,6 +204,27 @@
 				});
 			});
 		}
+	});
+
+	// Merged orchestration: probe capability + register session if available.
+	$effect(() => {
+		if (!browser) return;
+		untrack(() => {
+			(async () => {
+				await mergedOrchestrationStore.probeCapability();
+				if (mergedOrchestrationStore.isEnabled) {
+					await mergedOrchestrationStore.registerSession();
+				}
+			})();
+		});
+	});
+
+	// Best-effort session close on tab hide / unload.
+	$effect(() => {
+		if (!browser) return;
+		const handler = () => mergedOrchestrationStore.closeSession();
+		window.addEventListener('pagehide', handler);
+		return () => window.removeEventListener('pagehide', handler);
 	});
 
 	// Monitor API key changes and redirect to error page if removed or changed when required
