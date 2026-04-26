@@ -76,6 +76,18 @@ class MergedOrchestrationStore {
 		}
 	}
 
+	/**
+	 * Re-register the session against the proxy so client_tools reflect the
+	 * current MCP state. Phase 1 strategy: close + re-register (full reconcile).
+	 * Phase 2 may switch to a delta-PATCH against /api/sessions/{id}.
+	 */
+	async reconcile(): Promise<void> {
+		if (!this._capability?.enabled) return;
+		// closeSession is sync (sendBeacon best-effort); registerSession is async.
+		this.closeSession();
+		await this.registerSession();
+	}
+
 	closeSession(): void {
 		if (!this._session) return;
 		try {

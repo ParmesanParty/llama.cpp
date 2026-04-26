@@ -269,6 +269,34 @@
 			}
 		);
 	});
+
+	// Merged orchestration: reconcile session when MCP server set changes.
+	// Phase 1 minimal: any connectedServers change triggers a full re-register.
+	let lastReconcileSignature = '';
+	$effect(() => {
+		if (!browser) return;
+		// Read both lists so the effect tracks them. JSON-stringify the sorted
+		// list so equivalent reorderings don't trigger redundant reconciles.
+		const sig = JSON.stringify([...mcpStore.connectedServerNames].sort());
+		if (sig === lastReconcileSignature) return;
+		const previous = lastReconcileSignature;
+		lastReconcileSignature = sig;
+
+		// Skip the very first run: Task 18's effect handles initial registration.
+		if (previous === '') return;
+		if (!mergedOrchestrationStore.isEnabled) return;
+		if (!mergedOrchestrationStore.sessionId) return;
+
+		untrack(() => {
+			(async () => {
+				try {
+					await mergedOrchestrationStore.reconcile();
+				} catch (e) {
+					console.warn('[layout] merged orchestration reconcile failed', e);
+				}
+			})();
+		});
+	});
 </script>
 
 <Tooltip.Provider delayDuration={TOOLTIP_DELAY_DURATION}>
