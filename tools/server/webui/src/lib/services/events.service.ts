@@ -1,6 +1,7 @@
 import { toast } from 'svelte-sonner';
 import { modelsStore } from '$lib/stores/models.svelte';
 import { serverStore } from '$lib/stores/server.svelte';
+import { toolHealthStore } from '$lib/stores/toolHealth.svelte';
 
 /**
  * EventsService — SSE client for proxy push notifications.
@@ -32,6 +33,10 @@ export class EventsService {
 			if (this.hasConnected) {
 				serverStore.fetch();
 			}
+			// Reconcile tool-health on every connect/reconnect — breakers may
+			// have transitioned while we were disconnected.
+			toolHealthStore.fetchSnapshot();
+			toolHealthStore.markSseConnected();
 			this.hasConnected = true;
 		};
 
@@ -72,10 +77,20 @@ export class EventsService {
 			}
 		});
 
+		this.eventSource.addEventListener('tool-health-changed', (e: MessageEvent) => {
+			try {
+				const data = JSON.parse(e.data);
+				toolHealthStore.applyChange(data);
+			} catch {
+				// Ignore malformed events
+			}
+		});
+
 		this.eventSource.onerror = () => {
 			// EventSource auto-reconnects on transient errors.
 			// If the connection closes permanently, fall back to manual reconnect.
 			if (this.eventSource?.readyState === EventSource.CLOSED) {
+				toolHealthStore.markSseDisconnected();
 				this.disconnect();
 				this.reconnectTimer = setTimeout(() => {
 					this.reconnectTimer = null;
@@ -98,5 +113,6 @@ export class EventsService {
 			this.eventSource = null;
 		}
 		this.hasConnected = false;
+		toolHealthStore.markSseDisconnected();
 	}
 }
