@@ -10,14 +10,16 @@
 		ChevronDown,
 		Database,
 		Brain,
-		RotateCcw
+		RotateCcw,
+		Wrench
 	} from '@lucide/svelte';
 	import {
 		ChatSettingsFooter,
 		ChatSettingsImportExportTab,
 		ChatSettingsFields,
 		McpLogo,
-		McpServersSettings
+		McpServersSettings,
+		ToolsSettings
 	} from '$lib/components/app';
 	import { ScrollArea } from '$lib/components/ui/scroll-area';
 	import { config, settingsStore } from '$lib/stores/settings.svelte';
@@ -307,6 +309,11 @@
 			]
 		},
 		{
+			title: SETTINGS_SECTION_TITLES.TOOLS,
+			icon: Wrench,
+			fields: []
+		},
+		{
 			title: SETTINGS_SECTION_TITLES.DEVELOPER,
 			icon: Code,
 			fields: [
@@ -592,6 +599,8 @@
 							<McpServersSettings />
 						</div>
 					</div>
+				{:else if currentSection.title === SETTINGS_SECTION_TITLES.TOOLS}
+					<ToolsSettings />
 				{:else}
 					<div class="space-y-6">
 						<ChatSettingsFields
