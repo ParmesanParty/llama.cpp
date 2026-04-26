@@ -21,7 +21,6 @@ import type {
 	ApiToolStatusEvent,
 	ApiRetractionEvent,
 	ApiSourcesEvent,
-	ApiToolHealthEvent,
 	ApiToolArtifactsEvent
 } from '$lib/types/api';
 import type { DatabaseMessageExtraMcpPrompt, DatabaseMessageExtraMcpResource } from '$lib/types';
@@ -105,7 +104,6 @@ export class ChatService {
 			onToolStatus,
 			onRetraction,
 			onSources,
-			onToolHealth,
 			onToolArtifacts,
 			// Tools for function calling
 			tools,
@@ -301,7 +299,6 @@ export class ChatService {
 						onToolStatus,
 						onRetraction,
 						onSources,
-						onToolHealth,
 						onToolArtifacts
 					},
 					signal
@@ -513,7 +510,6 @@ export class ChatService {
 			onToolStatus?: (event: ApiToolStatusEvent) => void;
 			onRetraction?: (event: ApiRetractionEvent) => void;
 			onSources?: (event: ApiSourcesEvent) => void;
-			onToolHealth?: (event: ApiToolHealthEvent) => void;
 			onToolArtifacts?: (event: ApiToolArtifactsEvent) => void;
 		},
 		abortSignal?: AbortSignal
@@ -530,7 +526,6 @@ export class ChatService {
 			onToolStatus,
 			onRetraction,
 			onSources,
-			onToolHealth,
 			onToolArtifacts
 		} = callbacks;
 
@@ -608,9 +603,6 @@ export class ChatService {
 						break;
 					case 'sources':
 						onSources?.(payload as ApiSourcesEvent);
-						break;
-					case 'tool_health':
-						onToolHealth?.(payload as ApiToolHealthEvent);
 						break;
 					case 'tool_artifacts':
 						onToolArtifacts?.(payload as ApiToolArtifactsEvent);

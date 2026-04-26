@@ -857,7 +857,6 @@ class ChatStore {
 			onToolStatus: streamCallbacks.onToolStatus,
 			onRetraction: streamCallbacks.onRetraction,
 			onSources: streamCallbacks.onSources,
-			onToolHealth: streamCallbacks.onToolHealth,
 			onToolArtifacts: streamCallbacks.onToolArtifacts,
 			onCompaction: streamCallbacks.onCompaction,
 			onComplete: async (

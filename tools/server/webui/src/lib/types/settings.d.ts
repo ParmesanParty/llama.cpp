@@ -7,7 +7,6 @@ import type {
 	ApiToolStatusEvent,
 	ApiRetractionEvent,
 	ApiSourcesEvent,
-	ApiToolHealthEvent,
 	ApiToolArtifactsEvent
 } from './api';
 import type { ParameterSource, SyncableParameterType, SettingsFieldType } from '$lib/enums';
@@ -84,7 +83,6 @@ export interface SettingsChatServiceOptions {
 	onToolStatus?: (event: ApiToolStatusEvent) => void;
 	onRetraction?: (event: ApiRetractionEvent) => void;
 	onSources?: (event: ApiSourcesEvent) => void;
-	onToolHealth?: (event: ApiToolHealthEvent) => void;
 	onToolArtifacts?: (event: ApiToolArtifactsEvent) => void;
 }
 

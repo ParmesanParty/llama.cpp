@@ -24,7 +24,6 @@ export type {
 	ApiToolStatusEvent,
 	ApiRetractionEvent,
 	ApiSourcesEvent,
-	ApiToolHealthEvent,
 	ApiToolArtifactsEvent,
 	ApiToolArtifactPayload,
 	ApiSlotData,

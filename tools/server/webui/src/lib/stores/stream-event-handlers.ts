@@ -11,7 +11,6 @@ import type {
 	ApiToolStatusEvent,
 	ApiRetractionEvent,
 	ApiSourcesEvent,
-	ApiToolHealthEvent,
 	ApiToolArtifactsEvent,
 	ApiCompactionMetadata,
 	StreamEvent,
@@ -41,7 +40,7 @@ export interface StreamEventContext {
  * Create stream event handler callbacks.
  *
  * Returns an object with onToolStatus, onRetraction, onSources,
- * onToolHealth, and onCompaction — ready to spread into ChatStreamCallbacks.
+ * and onCompaction — ready to spread into ChatStreamCallbacks.
  */
 export function createStreamEventHandlers(ctx: StreamEventContext) {
 	let pendingFlush = false;
@@ -87,11 +86,6 @@ export function createStreamEventHandlers(ctx: StreamEventContext) {
 				offset: 0,
 				data: event as unknown as Record<string, unknown>
 			});
-		},
-		onToolHealth: (event: ApiToolHealthEvent) => {
-			console.warn(
-				`[tool-health] ${event.tool}: ${event.state} — ${event.reason}`
-			);
 		},
 		onToolArtifacts: (event: ApiToolArtifactsEvent) => {
 			// (1) Keep the raw event in streamEvents for tool-panel history / debug rendering.
