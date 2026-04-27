@@ -546,7 +546,6 @@ export class ChatService {
 			throw new Error('No response body');
 		}
 
-		const decoder = new TextDecoder();
 		let aggregatedContent = '';
 		let fullReasoningContent = '';
 		let aggregatedToolCalls: ApiChatCompletionToolCall[] = [];
@@ -555,6 +554,27 @@ export class ChatService {
 		let modelEmitted = false;
 		let toolCallIndexOffset = 0;
 		let hasOpenToolCallBatch = false;
+
+		// SSE reconnection tracking
+		let lastEventId = '-1';
+		let activeRequestId: string | null = null;
+
+		// Per-correlation-ID dispatch state map to deduplicate re-emitted
+		// tool-execute events after SSE reconnection.
+		interface ToolCallbackBody {
+			ok: boolean;
+			content: string;
+			sources: unknown[];
+			artifacts: unknown[];
+			error_code: string | null;
+			client_latency_ms: number;
+		}
+		type DispatchState = 'dispatching' | 'completed' | 'failed';
+		interface DispatchEntry {
+			state: DispatchState;
+			result?: ToolCallbackBody;
+		}
+		const dispatchStateMap = new Map<string, DispatchEntry>();
 
 		const finalizeOpenToolCallBatch = () => {
 			if (!hasOpenToolCallBatch) {
@@ -599,6 +619,7 @@ export class ChatService {
 
 		// Typed SSE event routing
 		const EVENT_PREFIX = 'event: ';
+		const ID_PREFIX = 'id: ';
 		const routeTypedEvent = (eventType: string, data: string) => {
 			try {
 				const payload = JSON.parse(data);
@@ -653,15 +674,60 @@ export class ChatService {
 				console.warn('[ChatService] tool-execute received but no session registered');
 				return;
 			}
+
+			// Derive request_id from the first correlation_id we see
+			if (!activeRequestId) {
+				activeRequestId = data.correlation_id.split('.')[0];
+			}
+
+			const corrId = data.correlation_id;
+			const existing = dispatchStateMap.get(corrId);
+
+			// Deduplicate re-emitted events after SSE reconnection
+			if (existing) {
+				if (existing.state === 'dispatching') {
+					// In-flight — let the original call finish naturally
+					return;
+				}
+				if (existing.state === 'completed' && existing.result) {
+					// Re-POST cached success payload
+					try {
+						await fetch(`${base}/api/tool-callback/${sid}/${corrId}`, {
+							method: 'POST',
+							headers: {
+								'Content-Type': 'application/json',
+								'X-Session-Token': token,
+							},
+							body: JSON.stringify(existing.result),
+						});
+					} catch (e) {
+						console.warn('[ChatService] tool-callback re-POST failed', e);
+					}
+					return;
+				}
+				if (existing.state === 'failed' && existing.result) {
+					// Re-POST cached failure payload
+					try {
+						await fetch(`${base}/api/tool-callback/${sid}/${corrId}`, {
+							method: 'POST',
+							headers: {
+								'Content-Type': 'application/json',
+								'X-Session-Token': token,
+							},
+							body: JSON.stringify(existing.result),
+						});
+					} catch (e) {
+						console.warn('[ChatService] tool-callback re-POST (failure) failed', e);
+					}
+					return;
+				}
+			}
+
+			// Mark as dispatching before the async call
+			dispatchStateMap.set(corrId, { state: 'dispatching' });
+
 			const startedAt = performance.now();
-			let body: {
-				ok: boolean;
-				content: string;
-				sources: unknown[];
-				artifacts: unknown[];
-				error_code: string | null;
-				client_latency_ms: number;
-			};
+			let body: ToolCallbackBody;
 			try {
 				const result = await mcpStore.executeToolByName(data.tool_name_local, data.args);
 				body = {
@@ -672,6 +738,8 @@ export class ChatService {
 					error_code: result.isError ? 'tool_error' : null,
 					client_latency_ms: Math.round(performance.now() - startedAt),
 				};
+				// Cache before POST so reconnect re-POSTs correctly
+				dispatchStateMap.set(corrId, { state: 'completed', result: body });
 			} catch (e) {
 				console.warn('[ChatService] tool-execute dispatch failed', e);
 				body = {
@@ -682,9 +750,11 @@ export class ChatService {
 					error_code: 'tool_error',
 					client_latency_ms: Math.round(performance.now() - startedAt),
 				};
+				// Cache full failure body so reconnect re-POSTs with real latency
+				dispatchStateMap.set(corrId, { state: 'failed', result: body });
 			}
 			try {
-				await fetch(`${base}/api/tool-callback/${sid}/${data.correlation_id}`, {
+				await fetch(`${base}/api/tool-callback/${sid}/${corrId}`, {
 					method: 'POST',
 					headers: {
 						'Content-Type': 'application/json',
@@ -702,24 +772,33 @@ export class ChatService {
 			console.info('[ChatService] tool-execute-cancel', data.correlation_id);
 		};
 
-		try {
+		// Inner read-loop: drains a reader into the shared stream state.
+		// Uses streamFinished (closure var) as source of truth; returns void.
+		const drainReader = async (r: ReadableStreamDefaultReader<Uint8Array>): Promise<void> => {
+			const decoder = new TextDecoder(); // fresh per invocation — no cross-stream state leaks
 			let chunk = '';
 			let pendingEventType: string | null = null;
 
 			while (true) {
-				if (abortSignal?.aborted) break;
+				if (abortSignal?.aborted) return;
 
-				const { done, value } = await reader.read();
-				if (done) break;
+				const { done, value } = await r.read();
+				if (done) return;
 
-				if (abortSignal?.aborted) break;
+				if (abortSignal?.aborted) return;
 
 				chunk += decoder.decode(value, { stream: true });
 				const lines = chunk.split('\n');
 				chunk = lines.pop() || '';
 
 				for (const line of lines) {
-					if (abortSignal?.aborted) break;
+					if (abortSignal?.aborted) return;
+
+					// SSE id: line — track Last-Event-Id for reconnection
+					if (line.startsWith(ID_PREFIX)) {
+						lastEventId = line.slice(ID_PREFIX.length).trim();
+						continue;
+					}
 
 					// Typed SSE event: "event: <type>" line precedes its "data: " line
 					if (line.startsWith(EVENT_PREFIX)) {
@@ -793,7 +872,61 @@ export class ChatService {
 					}
 				}
 
-				if (abortSignal?.aborted) break;
+				if (abortSignal?.aborted) return;
+			}
+		};
+
+		// Attempt a single reconnect after stream drop.
+		const reconnectStream = async (requestId: string, eventId: string): Promise<void> => {
+			const sid = mergedOrchestrationStore.sessionId;
+			const token = mergedOrchestrationStore.sessionToken;
+			if (!sid || !token) {
+				console.warn('[ChatService] reconnectStream: no session, cannot resume');
+				return;
+			}
+			console.info('[ChatService] Reconnecting stream', { requestId, eventId });
+			let resumeResponse: Response;
+			try {
+				resumeResponse = await fetch(`./v1/chat/completions`, {
+					method: 'POST',
+					headers: {
+						'Content-Type': 'application/json',
+						'X-Session-Token': token,
+						'X-Resume-Request': requestId,
+						'Last-Event-Id': eventId,
+						'Accept': 'text/event-stream',
+					},
+					body: JSON.stringify({ messages: [], session_id: sid, stream: true }),
+				});
+			} catch (e) {
+				console.warn('[ChatService] reconnectStream: fetch failed', e);
+				return;
+			}
+			if (resumeResponse.status === 410 || resumeResponse.status === 412) {
+				console.warn('[ChatService] reconnectStream: server rejected resume', resumeResponse.status);
+				return;
+			}
+			const resumeReader = resumeResponse.body?.getReader();
+			if (!resumeReader) {
+				console.warn('[ChatService] reconnectStream: no response body');
+				return;
+			}
+			try {
+				await drainReader(resumeReader);
+			} finally {
+				resumeReader.releaseLock();
+			}
+		};
+
+		try {
+			try {
+				await drainReader(reader);
+			} catch (streamError) {
+				// Stream dropped — attempt a single reconnect if we have a request ID
+				if (!abortSignal?.aborted && activeRequestId) {
+					console.warn('[ChatService] Stream dropped, attempting reconnect', streamError);
+					await reconnectStream(activeRequestId, lastEventId);
+				}
 			}
 
 			if (abortSignal?.aborted) return;
