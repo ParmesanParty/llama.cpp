@@ -37,12 +37,16 @@
 		url_fetch: 'Choosing URL'
 	};
 
-	let IconComponent = $derived(iconMap[tool] ?? Globe);
-	let label = $derived(labelMap[tool] ?? tool);
+	// Merged-orchestration namespaces server-side tools as `__server.<name>`
+	// (e.g. `__server.code_exec`). Strip the prefix for icon/label lookup so
+	// the chip displays the friendly form regardless of session mode.
+	let bareTool = $derived(tool.startsWith('__server.') ? tool.slice('__server.'.length) : tool);
+	let IconComponent = $derived(iconMap[bareTool] ?? Globe);
+	let label = $derived(labelMap[bareTool] ?? bareTool);
 	let isWriting = $derived(
 		!!argStream && !argStream.complete && status !== 'completed' && status !== 'failed'
 	);
-	let writingLabel = $derived(writingLabelMap[tool] ?? 'Writing');
+	let writingLabel = $derived(writingLabelMap[bareTool] ?? 'Writing');
 	let displayLabel = $derived(isWriting ? writingLabel : label);
 	let statusColor = $derived(
 		status === 'completed'
@@ -88,7 +92,7 @@
 			<span class="tool-chip-query" class:query-expanded={expanded}>{query}</span>
 		{/if}
 		{#if argStream && !query}
-			{#if tool === 'code_exec'}
+			{#if bareTool === 'code_exec'}
 				<span
 					class="tool-chip-arg-code"
 					class:expanded

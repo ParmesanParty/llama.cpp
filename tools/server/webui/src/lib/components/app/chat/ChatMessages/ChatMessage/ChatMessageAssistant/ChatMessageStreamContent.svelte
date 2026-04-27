@@ -157,6 +157,12 @@
 			if (!groups.has(iter)) groups.set(iter, []);
 		}
 
+		// __server.<name> is an internal merged-orchestration namespace prefix.
+		// Strip it once at the chip-construction boundary so chip.tool, the
+		// expand/collapse key, and labelMap lookups are all consistent.
+		const stripServerPrefix = (t: string): string =>
+			t.startsWith('__server.') ? t.slice('__server.'.length) : t;
+
 		const iterations = [...groups.keys()].sort((a, b) => a - b);
 		return iterations.map((iter, i) => {
 			const events = groups.get(iter)!;
@@ -166,10 +172,11 @@
 			for (const e of events) {
 				const data = e.data as { tool?: string; status?: string; query?: string; call_id?: string };
 				if (data.tool && data.status) {
-					const key = data.call_id || data.tool;
+					const bare = stripServerPrefix(data.tool);
+					const key = data.call_id || bare;
 					const existing = latest.get(key);
 					latest.set(key, {
-						tool: data.tool,
+						tool: bare,
 						status: data.status,
 						query: data.query || existing?.query
 					});
@@ -181,7 +188,7 @@
 				if ((state.iteration ?? 1) !== iter) continue;
 				if (latest.has(callId)) continue;
 				if (!state.tool) continue;
-				latest.set(callId, { tool: state.tool, status: 'writing' });
+				latest.set(callId, { tool: stripServerPrefix(state.tool), status: 'writing' });
 			}
 			return {
 				reasoning: stepReasoning?.content,
