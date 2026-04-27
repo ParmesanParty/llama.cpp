@@ -109,7 +109,14 @@ export type DatabaseMessageExtra =
 	| DatabaseMessageExtraLegacyContext;
 
 export interface StreamEvent {
-	type: 'tool_status' | 'retraction' | 'sources' | 'tool_health' | 'compaction' | 'tool_artifacts';
+	type:
+		| 'tool_status'
+		| 'tool_arg_stream'
+		| 'retraction'
+		| 'sources'
+		| 'tool_health'
+		| 'compaction'
+		| 'tool_artifacts';
 	offset: number;
 	data: Record<string, unknown>;
 }

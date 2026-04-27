@@ -27,6 +27,7 @@
 import { AttachmentType } from '$lib/enums';
 import type {
 	ApiToolStatusEvent,
+	ApiToolArgStreamEvent,
 	ApiRetractionEvent,
 	ApiSourcesEvent,
 	ApiToolHealthEvent,
@@ -168,6 +169,16 @@ export function createStreamEventHandlers(ctx: StreamEventContext) {
 				...(a.url !== undefined ? { url: a.url } : {})
 			};
 			ctx.onAttachments?.(ctx.getCurrentMessageId(), [extra]);
+		},
+		onToolArgStream: (event: ApiToolArgStreamEvent) => {
+			// Accumulate per-call_id started/delta/completed events.  The
+			// chip renderer reduces them via buildArgStreamMap into a
+			// per-call writing-phase state for the in-flight chip body.
+			pushEvent({
+				type: 'tool_arg_stream',
+				offset: 0,
+				data: event as unknown as Record<string, unknown>
+			});
 		}
 	};
 

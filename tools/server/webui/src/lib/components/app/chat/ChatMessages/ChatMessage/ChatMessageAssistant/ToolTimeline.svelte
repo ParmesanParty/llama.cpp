@@ -58,7 +58,7 @@
     for (let i = 0; i < steps.length; i++) {
       if (steps[i].reasoning) reasoningToggles.set(i, true);
       for (const chip of steps[i].tools) {
-        if (chip.query) chipToggles.set(`${i}-${chip.call_id || chip.tool}`, true);
+        if (chip.query || chip.argStream) chipToggles.set(`${i}-${chip.call_id || chip.tool}`, true);
       }
     }
   }
@@ -67,7 +67,7 @@
     for (let i = 0; i < steps.length; i++) {
       if (steps[i].reasoning) reasoningToggles.set(i, false);
       for (const chip of steps[i].tools) {
-        if (chip.query) chipToggles.set(`${i}-${chip.call_id || chip.tool}`, false);
+        if (chip.query || chip.argStream) chipToggles.set(`${i}-${chip.call_id || chip.tool}`, false);
       }
     }
   }
@@ -81,7 +81,7 @@
         if (reasoningToggles.get(i)) expandedCount++;
       }
       for (const chip of steps[i].tools) {
-        if (chip.query) {
+        if (chip.query || chip.argStream) {
           count++;
           if (chipToggles.get(`${i}-${chip.call_id || chip.tool}`)) expandedCount++;
         }
@@ -102,6 +102,7 @@
           expanded={isChipExpanded(i, chip)}
           onToggleExpand={() => toggleChip(i, chip)}
           artifacts={chip.artifacts}
+          argStream={chip.argStream}
         />
       {/each}
     </div>

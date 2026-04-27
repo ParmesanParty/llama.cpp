@@ -9,9 +9,10 @@
 		expanded?: boolean;
 		onToggleExpand?: () => void;
 		artifacts?: ApiToolArtifactPayload[];
+		argStream?: { field: string; text: string; complete: boolean };
 	}
 
-	let { tool, status, query, expanded = false, onToggleExpand, artifacts }: Props = $props();
+	let { tool, status, query, expanded = false, onToggleExpand, artifacts, argStream }: Props = $props();
 
 	const iconMap: Record<string, typeof Search> = {
 		web_search: Search,
@@ -29,8 +30,20 @@
 		url_fetch: 'Fetching'
 	};
 
+	const writingLabelMap: Record<string, string> = {
+		code_exec: 'Writing code',
+		web_search: 'Forming query',
+		image_gen: 'Composing prompt',
+		url_fetch: 'Choosing URL'
+	};
+
 	let IconComponent = $derived(iconMap[tool] ?? Globe);
 	let label = $derived(labelMap[tool] ?? tool);
+	let isWriting = $derived(
+		!!argStream && !argStream.complete && status !== 'completed' && status !== 'failed'
+	);
+	let writingLabel = $derived(writingLabelMap[tool] ?? 'Writing');
+	let displayLabel = $derived(isWriting ? writingLabel : label);
 	let statusColor = $derived(
 		status === 'completed'
 			? 'var(--green-500, #22c55e)'
@@ -38,8 +51,8 @@
 				? 'var(--red-500, #ef4444)'
 				: 'var(--amber-500, #f59e0b)'
 	);
-	let isExecuting = $derived(status === 'executing');
-	let isClickable = $derived(!!query && !!onToggleExpand);
+	let isExecuting = $derived(status === 'executing' || isWriting);
+	let isClickable = $derived((!!query || !!argStream) && !!onToggleExpand);
 	let imageArtifacts = $derived(
 		(artifacts ?? []).filter((a) => a.kind === 'image')
 	);
@@ -70,9 +83,19 @@
 			style:background-color={statusColor}
 		></span>
 		<IconComponent class="tool-chip-icon" size={14} />
-		<span class="tool-chip-label">{label}</span>
+		<span class="tool-chip-label">{displayLabel}</span>
 		{#if query}
 			<span class="tool-chip-query" class:query-expanded={expanded}>{query}</span>
+		{/if}
+		{#if argStream && !query}
+			{#if tool === 'code_exec'}
+				<span
+					class="tool-chip-arg-code"
+					class:expanded
+				>{argStream.text || ' '}</span>
+			{:else}
+				<span class="tool-chip-query" class:query-expanded={expanded}>{argStream.text}</span>
+			{/if}
 		{/if}
 	</span>
 
@@ -162,6 +185,27 @@
 		white-space: normal;
 		max-width: none;
 		word-break: break-word;
+	}
+
+	.tool-chip-arg-code {
+		display: block;
+		font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+		font-size: 0.75rem;
+		line-height: 1.4;
+		max-height: 0;
+		max-width: 0;
+		overflow: hidden;
+		white-space: pre;
+		opacity: 0.85;
+		transition: max-height 200ms ease, max-width 200ms ease, padding 200ms ease;
+		padding: 0 0;
+	}
+
+	.tool-chip-arg-code.expanded {
+		max-height: 24rem;
+		max-width: 100%;
+		overflow: auto;
+		padding: 0.5rem 0.75rem 0.25rem;
 	}
 
 	.tool-chip-dot {

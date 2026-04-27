@@ -195,6 +195,7 @@ export interface ToolChip {
 	query?: string;
 	call_id?: string;
 	artifacts?: ApiToolArtifactPayload[];
+	argStream?: { field: string; text: string; complete: boolean };
 }
 
 export interface ToolStep {

@@ -48,7 +48,6 @@ import type {
 } from '$lib/types/chat';
 import type {
 	ApiProcessingState,
-	ApiToolArgStreamEvent,
 	ConversationCompaction,
 	DatabaseMessage,
 	DatabaseMessageExtra,
@@ -906,17 +905,7 @@ class ChatStore {
 				});
 				if (onError) onError(error);
 			},
-			...typedEventHandlers,
-			onToolArgStream: (_event: ApiToolArgStreamEvent) => {
-				// Wire-only landing zone. The proxy emits per-call_id
-				// started/delta/completed events for in-flight tool args
-				// (used to show streamed argument text in a chip while the
-				// LLM is still emitting the tool call). The chip renderer
-				// (ChatMessageStreamContent.svelte) is not yet ported, so
-				// these events are consumed and discarded. Replace the
-				// body with per-correlation arg accumulation when the chip
-				// component lands.
-			}
+			...typedEventHandlers
 		};
 
 		const perChatOverrides = conversationsStore.activeConversation?.mcpServerOverrides;

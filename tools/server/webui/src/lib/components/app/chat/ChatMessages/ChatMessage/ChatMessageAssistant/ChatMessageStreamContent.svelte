@@ -8,6 +8,7 @@
 	import { config } from '$lib/stores/settings.svelte';
 	import type { StreamEvent, DatabaseMessageExtra, ApiToolArtifactPayload } from '$lib/types';
 	import type { SourceItem, ToolStep } from '$lib/types/chat';
+	import { buildArgStreamMap } from '$lib/utils/arg-stream-aggregator';
 
 	interface Props {
 		content: string;
@@ -146,6 +147,16 @@
 			artifactMap.set(data.call_id, [...existing, data.artifact]);
 		}
 
+		const argStreamMap = buildArgStreamMap(streamEvents);
+
+		// arg_stream `started` events fire before any tool_status `executing`
+		// for the same call — register a placeholder iteration so writing-only
+		// chips render before execution begins.
+		for (const [, state] of argStreamMap) {
+			const iter = state.iteration ?? 1;
+			if (!groups.has(iter)) groups.set(iter, []);
+		}
+
 		const iterations = [...groups.keys()].sort((a, b) => a - b);
 		return iterations.map((iter, i) => {
 			const events = groups.get(iter)!;
@@ -164,6 +175,14 @@
 					});
 				}
 			}
+			// Add chips that exist only via arg_stream (writing phase, before
+			// the tool_status `executing` event fires for this call_id).
+			for (const [callId, state] of argStreamMap) {
+				if ((state.iteration ?? 1) !== iter) continue;
+				if (latest.has(callId)) continue;
+				if (!state.tool) continue;
+				latest.set(callId, { tool: state.tool, status: 'writing' });
+			}
 			return {
 				reasoning: stepReasoning?.content,
 				reasoningPending: stepReasoning?.pending,
@@ -172,7 +191,8 @@
 					status: info.status,
 					query: info.query,
 					call_id: key,
-					artifacts: artifactMap.get(key)
+					artifacts: artifactMap.get(key),
+					argStream: argStreamMap.get(key)
 				}))
 			};
 		});
