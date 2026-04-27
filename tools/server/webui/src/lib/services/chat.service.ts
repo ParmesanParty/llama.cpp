@@ -27,6 +27,8 @@ import type { DatabaseMessageExtraMcpPrompt, DatabaseMessageExtraMcpResource } f
 import { modelsStore } from '$lib/stores/models.svelte';
 import { mcpStore } from '$lib/stores/mcp.svelte';
 import { mergedOrchestrationStore } from '$lib/stores/merged-orchestration.svelte';
+import { extractToolResult } from '$lib/services/tool-result-extractor';
+import type { ExtractedToolResult } from '$lib/services/tool-result-extractor';
 import { base } from '$app/paths';
 
 export class ChatService {
@@ -564,8 +566,8 @@ export class ChatService {
 		interface ToolCallbackBody {
 			ok: boolean;
 			content: string;
-			sources: unknown[];
-			artifacts: unknown[];
+			sources: ExtractedToolResult['sources'];
+			artifacts: ExtractedToolResult['artifacts'];
 			error_code: string | null;
 			client_latency_ms: number;
 		}
@@ -737,11 +739,12 @@ export class ChatService {
 			let body: ToolCallbackBody;
 			try {
 				const result = await mcpStore.executeToolByName(data.tool_name_local, data.args, ctrl.signal);
+				const extracted = extractToolResult(result.raw);
 				body = {
 					ok: !result.isError,
-					content: result.content,
-					sources: [],
-					artifacts: [],
+					content: extracted.content,
+					sources: extracted.sources,
+					artifacts: extracted.artifacts,
 					error_code: result.isError ? 'tool_error' : null,
 					client_latency_ms: Math.round(performance.now() - startedAt),
 				};

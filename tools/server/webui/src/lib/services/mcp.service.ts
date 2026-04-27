@@ -29,6 +29,7 @@ import type {
 	MCPServerConfig,
 	ToolCallParams,
 	ToolExecutionResult,
+	MCPRawToolCallResult,
 	Implementation,
 	ClientCapabilities,
 	MCPConnection,
@@ -815,9 +816,11 @@ export class MCPService {
 				{ signal }
 			);
 
+			const raw = result as MCPRawToolCallResult;
 			return {
-				content: this.formatToolResult(result as ToolCallResult),
-				isError: (result as ToolCallResult).isError ?? false
+				content: this.formatToolResult(raw as ToolCallResult),
+				isError: raw.isError ?? false,
+				raw,
 			};
 		} catch (error) {
 			if (isAbortError(error)) {

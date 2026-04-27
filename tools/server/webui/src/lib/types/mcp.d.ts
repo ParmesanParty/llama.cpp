@@ -251,9 +251,33 @@ export interface ToolCallParams {
 	arguments: Record<string, unknown>;
 }
 
+export interface MCPRawContentPart {
+	type: string;
+	text?: string;
+	data?: string;
+	mimeType?: string;
+	resource?: {
+		uri: string;
+		text?: string;
+		mimeType?: string;
+	};
+}
+
+export interface MCPRawToolCallResult {
+	content: MCPRawContentPart[];
+	isError?: boolean;
+	_meta?: {
+		// Origin: untrusted MCP server. Validate at the use site
+		// (tool-result-extractor.ts) rather than trusting the shape here.
+		sources?: unknown[];
+		[key: string]: unknown;
+	};
+}
+
 export interface ToolExecutionResult {
 	content: string;
 	isError: boolean;
+	raw: MCPRawToolCallResult;
 }
 
 /**
