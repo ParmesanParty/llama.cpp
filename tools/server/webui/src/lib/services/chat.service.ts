@@ -573,8 +573,10 @@ export class ChatService {
 		interface DispatchEntry {
 			state: DispatchState;
 			result?: ToolCallbackBody;
+			error?: string;
 		}
 		const dispatchStateMap = new Map<string, DispatchEntry>();
+		const dispatchAbortControllerMap = new Map<string, AbortController>();
 
 		const finalizeOpenToolCallBatch = () => {
 			if (!hasOpenToolCallBatch) {
@@ -649,7 +651,7 @@ export class ChatService {
 						});
 						break;
 					case 'tool-execute-cancel':
-						handleToolExecuteCancelEvent(payload as { correlation_id: string });
+						handleToolExecuteCancelEvent(payload as { correlation_id: string; reason: string });
 						break;
 					default:
 						if (import.meta.env.DEV) {
@@ -705,31 +707,36 @@ export class ChatService {
 					}
 					return;
 				}
-				if (existing.state === 'failed' && existing.result) {
-					// Re-POST cached failure payload
-					try {
-						await fetch(`${base}/api/tool-callback/${sid}/${corrId}`, {
-							method: 'POST',
-							headers: {
-								'Content-Type': 'application/json',
-								'X-Session-Token': token,
-							},
-							body: JSON.stringify(existing.result),
-						});
-					} catch (e) {
-						console.warn('[ChatService] tool-callback re-POST (failure) failed', e);
+				if (existing.state === 'failed') {
+					if (existing.result) {
+						// Re-POST cached failure payload
+						try {
+							await fetch(`${base}/api/tool-callback/${sid}/${corrId}`, {
+								method: 'POST',
+								headers: {
+									'Content-Type': 'application/json',
+									'X-Session-Token': token,
+								},
+								body: JSON.stringify(existing.result),
+							});
+						} catch (e) {
+							console.warn('[ChatService] tool-callback re-POST (failure) failed', e);
+						}
 					}
+					// else: aborted — no result to POST; server already resolved via cancel
 					return;
 				}
 			}
 
-			// Mark as dispatching before the async call
+			// Set up AbortController and mark as dispatching
+			const ctrl = new AbortController();
+			dispatchAbortControllerMap.set(corrId, ctrl);
 			dispatchStateMap.set(corrId, { state: 'dispatching' });
 
 			const startedAt = performance.now();
 			let body: ToolCallbackBody;
 			try {
-				const result = await mcpStore.executeToolByName(data.tool_name_local, data.args);
+				const result = await mcpStore.executeToolByName(data.tool_name_local, data.args, ctrl.signal);
 				body = {
 					ok: !result.isError,
 					content: result.content,
@@ -740,7 +747,22 @@ export class ChatService {
 				};
 				// Cache before POST so reconnect re-POSTs correctly
 				dispatchStateMap.set(corrId, { state: 'completed', result: body });
-			} catch (e) {
+			} catch (e: unknown) {
+				if (ctrl.signal.aborted) {
+					if (!isAbortError(e)) {
+						console.warn('[ChatService] non-abort exception during tool cancel', e);
+					}
+					// Server already knows about the cancel via tool-execute-cancel;
+					// mark as failed with no result so reconnect dedup skips re-POST.
+					// Preserve the cancel handler's reason (e.g. 'timeout') if already set.
+					const existingEntry = dispatchStateMap.get(corrId);
+					const reason =
+						existingEntry?.state === 'failed' && existingEntry.error
+							? existingEntry.error
+							: 'aborted';
+					dispatchStateMap.set(corrId, { state: 'failed', error: reason });
+					return;
+				}
 				console.warn('[ChatService] tool-execute dispatch failed', e);
 				body = {
 					ok: false,
@@ -752,6 +774,8 @@ export class ChatService {
 				};
 				// Cache full failure body so reconnect re-POSTs with real latency
 				dispatchStateMap.set(corrId, { state: 'failed', result: body });
+			} finally {
+				dispatchAbortControllerMap.delete(corrId);
 			}
 			try {
 				await fetch(`${base}/api/tool-callback/${sid}/${corrId}`, {
@@ -767,9 +791,12 @@ export class ChatService {
 			}
 		};
 
-		const handleToolExecuteCancelEvent = (data: { correlation_id: string }): void => {
-			// Phase 1: log only. Phase 2 wires AbortSignal propagation.
-			console.info('[ChatService] tool-execute-cancel', data.correlation_id);
+		const handleToolExecuteCancelEvent = (data: { correlation_id: string; reason: string }): void => {
+			const ctrl = dispatchAbortControllerMap.get(data.correlation_id);
+			if (ctrl) ctrl.abort();
+			// Pre-poison the state so that if tool-execute arrives late, dedup
+			// short-circuits without dispatching.
+			dispatchStateMap.set(data.correlation_id, { state: 'failed', error: data.reason });
 		};
 
 		// Inner read-loop: drains a reader into the shared stream state.
