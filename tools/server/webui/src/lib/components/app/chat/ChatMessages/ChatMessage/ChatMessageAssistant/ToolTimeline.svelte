@@ -44,12 +44,34 @@
   // Chip expansion state: keyed by "stepIdx-{call_id || tool}"
   let chipToggles = new SvelteMap<string, boolean>();
 
+  function chipKey(stepIdx: number, chip: ToolChip): string {
+    return `${stepIdx}-${chip.call_id || chip.tool}`;
+  }
+
+  // Phase-aware sticky auto-expand: the first time we observe a chip in
+  // writing/executing state, persist a `true` toggle so the user sees the
+  // streaming code without clicking. Once set, it stays — phase-change to
+  // completed doesn't yank the panel out from under the reader. User
+  // toggles still win (they replace the persisted value).
+  $effect(() => {
+    for (let i = 0; i < steps.length; i++) {
+      for (const chip of steps[i].tools) {
+        if (chip.status === 'writing' || chip.status === 'executing') {
+          const key = chipKey(i, chip);
+          if (!chipToggles.has(key)) {
+            chipToggles.set(key, true);
+          }
+        }
+      }
+    }
+  });
+
   function isChipExpanded(stepIdx: number, chip: ToolChip): boolean {
-    return chipToggles.get(`${stepIdx}-${chip.call_id || chip.tool}`) ?? false;
+    return chipToggles.get(chipKey(stepIdx, chip)) ?? false;
   }
 
   function toggleChip(stepIdx: number, chip: ToolChip) {
-    const key = `${stepIdx}-${chip.call_id || chip.tool}`;
+    const key = chipKey(stepIdx, chip);
     chipToggles.set(key, !chipToggles.get(key));
   }
 

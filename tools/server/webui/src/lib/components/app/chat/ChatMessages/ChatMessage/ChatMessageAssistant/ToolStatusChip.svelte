@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { Search, Cloud, Code, Image, Globe } from '@lucide/svelte';
+	import SyntaxHighlightedCode from '$lib/components/app/content/SyntaxHighlightedCode.svelte';
 	import type { ApiToolArtifactPayload } from '$lib/types';
 
 	interface Props {
@@ -61,6 +62,76 @@
 		(artifacts ?? []).filter((a) => a.kind === 'image')
 	);
 
+	// code_exec gets a detached, syntax-highlighted block (sibling of the
+	// chip) instead of the bespoke monospace span nested inside the pill.
+	// The pill stays small; the code lives below it as its own block — so
+	// the chip identity isn't crushed by the body of the code.
+	let isCodeExec = $derived(bareTool === 'code_exec');
+	let showDetachedCode = $derived(isCodeExec && !!argStream && expanded);
+	let inlineArgStream = $derived(!!argStream && !query && !isCodeExec);
+
+	let codeContainer: HTMLDivElement | undefined = $state();
+	// Auto-scroll is "sticky": engaged while the user's view is at (or
+	// near) the bottom of the code wrapper. If they scroll up to read an
+	// earlier line, we stop yanking them back; when they scroll back down
+	// to the tail, auto-scroll re-engages. Default is true so the first
+	// few streamed deltas pin to the bottom out of the gate.
+	let stickToBottom = $state(true);
+	const STICK_TOLERANCE_PX = 8;
+
+	// Streaming-only auto-scroll: while the model is writing the code, pin
+	// the visible window to the latest line so the user always sees what
+	// just arrived. Once the stream completes, reset to the top — the
+	// reader expects to start from line 1 when re-opening the panel.
+	$effect(() => {
+		if (!argStream || !codeContainer) return;
+		const wrapper = codeContainer.querySelector('.code-preview-wrapper');
+		if (!(wrapper instanceof HTMLElement)) return;
+
+		if (argStream.complete) {
+			wrapper.scrollTop = 0;
+			// Reset for any subsequent re-streaming on the same chip
+			// (rare, but keeps the state machine clean).
+			stickToBottom = true;
+			return;
+		}
+
+		// Read text inside the effect to register a reactive dependency
+		// on every fragment update. The actual scroll runs in rAF so the
+		// child SyntaxHighlightedCode has finished patching the DOM with
+		// the new highlighted HTML — without that, scrollHeight reflects
+		// the previous frame and we'd land one line short.
+		const text = argStream.text;
+		if (!text) return;
+		requestAnimationFrame(() => {
+			// Read stickToBottom inside rAF so a user scroll that lands
+			// between effect-fire and frame-paint still wins. Reading
+			// here doesn't add a reactive dep (we're outside the effect
+			// closure scope by the time rAF runs) — that's intentional;
+			// the effect should re-fire on text/complete changes only.
+			if (!stickToBottom) return;
+			wrapper.scrollTop = wrapper.scrollHeight;
+		});
+	});
+
+	// Manual-scroll detection: flip stickToBottom off when the user pulls
+	// the viewport away from the tail, on again when they return to it.
+	// Programmatic scrolls (the rAF above) also fire scroll events, but
+	// they always land *at* the bottom so they leave stickToBottom=true.
+	$effect(() => {
+		if (!codeContainer) return;
+		const wrapper = codeContainer.querySelector('.code-preview-wrapper');
+		if (!(wrapper instanceof HTMLElement)) return;
+
+		const onScroll = () => {
+			const distanceFromBottom =
+				wrapper.scrollHeight - (wrapper.scrollTop + wrapper.clientHeight);
+			stickToBottom = distanceFromBottom <= STICK_TOLERANCE_PX;
+		};
+		wrapper.addEventListener('scroll', onScroll, { passive: true });
+		return () => wrapper.removeEventListener('scroll', onScroll);
+	});
+
 	function handleClick() {
 		if (!isClickable) return;
 		const selection = window.getSelection();
@@ -69,7 +140,7 @@
 	}
 </script>
 
-<div class="tool-chip-wrapper">
+<div class="tool-chip-wrapper" class:has-code-block={showDetachedCode}>
 	<!-- svelte-ignore a11y_no_static_element_interactions -->
 	<span
 		class="tool-chip"
@@ -91,17 +162,20 @@
 		{#if query}
 			<span class="tool-chip-query" class:query-expanded={expanded}>{query}</span>
 		{/if}
-		{#if argStream && !query}
-			{#if bareTool === 'code_exec'}
-				<span
-					class="tool-chip-arg-code"
-					class:expanded
-				>{argStream.text || ' '}</span>
-			{:else}
-				<span class="tool-chip-query" class:query-expanded={expanded}>{argStream.text}</span>
-			{/if}
+		{#if inlineArgStream && argStream}
+			<span class="tool-chip-query" class:query-expanded={expanded}>{argStream.text}</span>
 		{/if}
 	</span>
+
+	{#if showDetachedCode && argStream}
+		<div class="tool-chip-code-detached" bind:this={codeContainer}>
+			<SyntaxHighlightedCode
+				code={argStream.text || ' '}
+				language="python"
+				maxHeight="280px"
+			/>
+		</div>
+	{/if}
 
 	{#if imageArtifacts.length}
 		<div class="tool-chip-artifacts">
@@ -133,6 +207,20 @@
 		align-items: flex-start;
 		gap: 0.375rem;
 		flex-basis: auto;
+		min-width: 0;
+		max-width: 100%;
+	}
+
+	/* When a code block lives below the chip, the wrapper must claim the
+	   full row width — without this, the wrapper sizes to its widest
+	   child (the long code lines), which means there's no constraint for
+	   the inner overflow:auto to clip against, and the code visibly
+	   escapes the bordered box. The `has-code-block` class scopes this
+	   to chips that need it; web_search / weather / etc. without code
+	   bodies stay at their natural pill width and can still wrap into
+	   parallel-batch rows. */
+	.tool-chip-wrapper.has-code-block {
+		width: 100%;
 	}
 
 	.tool-chip {
@@ -191,25 +279,48 @@
 		word-break: break-word;
 	}
 
-	.tool-chip-arg-code {
-		display: block;
-		font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
-		font-size: 0.75rem;
-		line-height: 1.4;
-		max-height: 0;
-		max-width: 0;
-		overflow: hidden;
-		white-space: pre;
-		opacity: 0.85;
-		transition: max-height 200ms ease, max-width 200ms ease, padding 200ms ease;
-		padding: 0 0;
+	.tool-chip-code-detached {
+		/* Sibling of .tool-chip — the chip stays a small pill while the
+		   code lives in its own block below. align-self stretches us to
+		   the row's content area (parent .tool-chip-wrapper is a flex
+		   column with align-items: flex-start, so without this we'd be
+		   the chip's natural width). min-width: 0 lets the inner code
+		   shrink below its intrinsic content width when needed, which
+		   is what prevents long Python lines from blowing out the
+		   container before the wrapper's overflow:auto can kick in. */
+		align-self: stretch;
+		min-width: 0;
+		width: 100%;
+		max-width: 100%;
+		margin: 0 0 0.25rem 0;
 	}
 
-	.tool-chip-arg-code.expanded {
-		max-height: 24rem;
+	/* Tighten the SyntaxHighlightedCode wrapper inside our context:
+	   smaller text, slimmer padding. The wrapper itself only needs
+	   overflow-y for height clipping; horizontal scroll lives on the
+	   <pre> below because that's where the inline <code> child renders
+	   at its full content width. */
+	.tool-chip-code-detached :global(.code-preview-wrapper) {
+		font-size: 0.75rem;
+		overflow-y: auto;
+	}
+
+	.tool-chip-code-detached :global(.code-preview-wrapper pre) {
+		padding: 0.5rem 0.75rem;
+		/* No overflow on the <pre>: its inner <code> is `display: block`
+		   (set by .hljs) so it fits within the pre, and overflow at this
+		   level would never observe the long lines escaping. */
+	}
+
+	/* The actual horizontal-scroll boundary lives on the <code> element.
+	   highlight.js's theme stylesheet sets display:block but does not
+	   include the `overflow-x: auto` rule from hljs's default.css, so
+	   long lines (white-space: pre) extend past the code element's box
+	   and visibly escape the bordered wrapper. Pinning overflow here is
+	   what finally clips and scrolls. */
+	.tool-chip-code-detached :global(.code-preview-wrapper code) {
+		overflow-x: auto;
 		max-width: 100%;
-		overflow: auto;
-		padding: 0.5rem 0.75rem 0.25rem;
 	}
 
 	.tool-chip-dot {
