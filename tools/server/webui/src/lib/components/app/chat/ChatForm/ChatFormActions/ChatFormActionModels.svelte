@@ -1,8 +1,12 @@
 <script lang="ts">
 	import { chatStore } from '$lib/stores/chat.svelte';
-	import { modelsStore, modelOptions, selectedModelId } from '$lib/stores/models.svelte';
+	import { modelsStore, modelOptions, selectedModelId, isSwitchable } from '$lib/stores/models.svelte';
 	import { isRouterMode, serverError } from '$lib/stores/server.svelte';
-	import { ModelsSelectorDropdown, ModelsSelectorSheet } from '$lib/components/app';
+	import {
+		ModelsSelectorDropdown,
+		ModelsSelectorSheet,
+		ModelsSelectorSwitchable
+	} from '$lib/components/app';
 	import { IsMobile } from '$lib/hooks/is-mobile.svelte';
 	import { activeMessages } from '$lib/stores/conversations.svelte';
 
@@ -32,6 +36,7 @@
 
 	let isRouter = $derived(isRouterMode());
 	let isOffline = $derived(!!serverError());
+	let switchableMode = $derived(isSwitchable());
 
 	let conversationModel = $derived(
 		chatStore.getConversationModel(activeMessages() as DatabaseMessage[])
@@ -131,8 +136,11 @@
 		}
 	});
 
-	let selectorModelRef: ModelsSelectorDropdown | ModelsSelectorSheet | undefined =
-		$state(undefined);
+	let selectorModelRef:
+		| ModelsSelectorDropdown
+		| ModelsSelectorSheet
+		| ModelsSelectorSwitchable
+		| undefined = $state(undefined);
 
 	let isMobile = new IsMobile();
 
@@ -141,7 +149,13 @@
 	}
 </script>
 
-{#if isMobile.current}
+{#if switchableMode}
+	<ModelsSelectorSwitchable
+		disabled={disabled || isOffline}
+		bind:this={selectorModelRef}
+		{forceForegroundText}
+	/>
+{:else if isMobile.current}
 	<ModelsSelectorSheet
 		disabled={disabled || isOffline}
 		bind:this={selectorModelRef}
