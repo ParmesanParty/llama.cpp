@@ -1,4 +1,3 @@
-import { getJsonHeaders } from '$lib/utils/api-headers';
 import { formatAttachmentText } from '$lib/utils/formatters';
 import { isAbortError } from '$lib/utils/abort';
 import { mergedOrchestrationStore } from '$lib/stores/merged-orchestration.svelte';
@@ -13,9 +12,7 @@ import {
 	ATTACHMENT_LABEL_PDF_FILE,
 	ATTACHMENT_LABEL_MCP_PROMPT,
 	ATTACHMENT_LABEL_MCP_RESOURCE,
-	REASONING_BOUNDARY,
-	RETRACTION_TAG,
-	LEGACY_AGENTIC_REGEX
+	REASONING_BOUNDARY
 } from '$lib/constants';
 import {
 	AttachmentType,
@@ -39,46 +36,6 @@ import type { DatabaseMessageExtraMcpPrompt, DatabaseMessageExtraMcpResource } f
 import { modelsStore } from '$lib/stores/models.svelte';
 
 export class ChatService {
-	/**
-	 * Strip content before a retraction marker (inclusive).
-	 * The model should not see hallucinated content from a prior nudge.
-	 */
-	private static stripRetractedContent(text: string): string {
-		const idx = text.indexOf(RETRACTION_TAG);
-		if (idx === -1) return text;
-		return text.slice(idx + RETRACTION_TAG.length);
-	}
-
-	private static stripReasoningContent(
-		content: ApiChatMessageData['content'] | null | undefined
-	): ApiChatMessageData['content'] | null | undefined {
-		if (!content) {
-			return content;
-		}
-
-		if (typeof content === 'string') {
-			return ChatService.stripRetractedContent(content).replace(
-				LEGACY_AGENTIC_REGEX.REASONING_BLOCK,
-				''
-			);
-		}
-
-		if (!Array.isArray(content)) {
-			return content;
-		}
-
-		return content.map((part: ApiChatMessageContentPart) => {
-			if (part.type !== ContentPartType.TEXT || !part.text) return part;
-			return {
-				...part,
-				text: ChatService.stripRetractedContent(part.text).replace(
-					LEGACY_AGENTIC_REGEX.REASONING_BLOCK,
-					''
-				)
-			};
-		});
-	}
-
 	/**
 	 *
 	 *
@@ -470,7 +427,7 @@ export class ChatService {
 			messages: normalizedMessages.map((msg: ApiChatMessageData) => {
 				const mapped: Record<string, unknown> = {
 					role: msg.role,
-					content: excludeReasoning ? ChatService.stripReasoningContent(msg.content) : msg.content,
+					content: msg.content,
 					tool_calls: msg.tool_calls,
 					tool_call_id: msg.tool_call_id
 				};
@@ -489,13 +446,23 @@ export class ChatService {
 			requestBody.model = model;
 		}
 
+		// Route through buildChatRequest so the pre-encode prefix matches the
+		// next real request when merged-orch is active. Without this the
+		// pre-encode goes through the no-session path (full server-side tool
+		// catalog injected, no session_id), the real request goes through the
+		// merged-orch path (session_id, tools stripped), and the prompt prefix
+		// diverges — KV cache built by pre-encode never gets reused.
+		const { url, init } = buildChatRequest({
+			requestBody,
+			stream: false,
+			signal,
+			sessionId: mergedOrchestrationStore.sessionId,
+			sessionToken: mergedOrchestrationStore.sessionToken,
+			disabledBuiltinTools: toolsStore.disabledBuiltinTools
+		});
+
 		try {
-			await fetch(`./v1/chat/completions`, {
-				method: 'POST',
-				headers: getJsonHeaders(),
-				body: JSON.stringify(requestBody),
-				signal
-			});
+			await fetch(url, init);
 		} catch (error) {
 			if (!isAbortError(error)) {
 				console.warn('[ChatService] Pre-encode request failed:', error);
