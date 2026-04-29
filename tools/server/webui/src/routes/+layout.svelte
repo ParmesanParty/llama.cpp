@@ -23,6 +23,7 @@
 	import { Toaster } from 'svelte-sonner';
 	import { modelsStore } from '$lib/stores/models.svelte';
 	import { mcpStore } from '$lib/stores/mcp.svelte';
+	import { mergedOrchestrationStore } from '$lib/stores/merged-orchestration.svelte';
 	import { TOOLTIP_DELAY_DURATION } from '$lib/constants';
 	import { IsMobile } from '$lib/hooks/is-mobile.svelte';
 	import { useKeyboardShortcuts } from '$lib/hooks/use-keyboard-shortcuts.svelte';
@@ -236,6 +237,53 @@
 	// Monitor API key changes and redirect to error page if removed or changed when required
 	$effect(() => {
 		checkApiKey();
+	});
+
+	// Merged orchestration: probe capability + register session if available.
+	$effect(() => {
+		if (!browser) return;
+		untrack(() => {
+			(async () => {
+				await mergedOrchestrationStore.probeCapability();
+				if (mergedOrchestrationStore.isEnabled) {
+					await mergedOrchestrationStore.registerSession();
+				}
+			})();
+		});
+	});
+
+	// Best-effort session close on tab hide / unload.
+	$effect(() => {
+		if (!browser) return;
+		const handler = () => mergedOrchestrationStore.closeSession();
+		window.addEventListener('pagehide', handler);
+		return () => window.removeEventListener('pagehide', handler);
+	});
+
+	// Merged orchestration: reconcile session when MCP server set changes.
+	let lastReconcileSignature = '';
+	$effect(() => {
+		if (!browser) return;
+		const sig = JSON.stringify([...mcpStore.connectedServerNames].sort());
+		if (sig === lastReconcileSignature) return;
+		const previous = lastReconcileSignature;
+		lastReconcileSignature = sig;
+
+		// Skip the very first run: the probe-and-register effect above handles
+		// initial registration with the correct connected-server set.
+		if (previous === '') return;
+		if (!mergedOrchestrationStore.isEnabled) return;
+		if (!mergedOrchestrationStore.sessionId) return;
+
+		untrack(() => {
+			(async () => {
+				try {
+					await mergedOrchestrationStore.reconcile();
+				} catch (e) {
+					console.warn('[layout] merged orchestration reconcile failed', e);
+				}
+			})();
+		});
 	});
 
 	// Set up title update confirmation callback
