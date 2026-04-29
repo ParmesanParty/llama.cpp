@@ -864,6 +864,13 @@ class ChatStore {
 				onReasoningChunk: streamCallbacks.onReasoningChunk,
 				onModel: streamCallbacks.onModel,
 				onTimings: streamCallbacks.onTimings,
+				onCompaction: streamCallbacks.onCompaction,
+				onToolStatus: streamCallbacks.onToolStatus,
+				onRetraction: streamCallbacks.onRetraction,
+				onSources: streamCallbacks.onSources,
+				onToolHealth: streamCallbacks.onToolHealth,
+				onToolArtifacts: streamCallbacks.onToolArtifacts,
+				onToolArgStream: streamCallbacks.onToolArgStream,
 				onComplete: async (
 					finalContent?: string,
 					reasoningContent?: string,
@@ -902,7 +909,6 @@ class ChatStore {
 				},
 				onError: streamCallbacks.onError
 			},
-			convId,
 			abortController.signal
 		);
 	}
@@ -1319,7 +1325,6 @@ class ChatStore {
 					}
 				},
 
-				msg.convId,
 				abortController.signal
 			);
 		} catch (error) {
@@ -1655,6 +1660,11 @@ class ChatStore {
 		if (currentConfig.disableReasoningParsing) apiOptions.disableReasoningParsing = true;
 		apiOptions.enableThinking = !!conversationsStore.activeThinkingEnabled;
 		apiOptions.preserveThinking = !!conversationsStore.activePreserveThinking;
+		// Pin code_exec to a per-conversation kernel pool entry so variables,
+		// imports, and dataframes persist across calls within a chat. Without
+		// this header the proxy assigns an ephemeral kernel per call.
+		const activeConvId = conversationsStore.activeConversation?.id;
+		if (activeConvId) apiOptions.codeExecSessionId = activeConvId;
 
 		if (currentConfig.excludeReasoningFromContext) apiOptions.excludeReasoningFromContext = true;
 

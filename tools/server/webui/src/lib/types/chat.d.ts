@@ -4,6 +4,8 @@ import type { DatabaseMessage, DatabaseMessageExtra } from './database';
 import type {
 	ApiCompactionMetadata,
 	ApiToolStatusEvent,
+	ApiToolArgStreamEvent,
+	ApiToolArtifactsEvent,
 	ApiRetractionEvent,
 	ApiSourcesEvent,
 	ApiToolHealthEvent
@@ -125,6 +127,8 @@ export interface ChatStreamCallbacks {
 	onRetraction?: (event: ApiRetractionEvent) => void;
 	onSources?: (event: ApiSourcesEvent) => void;
 	onToolHealth?: (event: ApiToolHealthEvent) => void;
+	onToolArtifacts?: (event: ApiToolArtifactsEvent) => void;
+	onToolArgStream?: (event: ApiToolArgStreamEvent) => void;
 }
 
 /**

@@ -1,10 +1,11 @@
-import { getJsonHeaders } from '$lib/utils/api-headers';
+import { getJsonHeaders, getStreamHeaders } from '$lib/utils/api-headers';
 import { formatAttachmentText } from '$lib/utils/formatters';
 import { isAbortError } from '$lib/utils/abort';
 import {
 	ATTACHMENT_LABEL_PDF_FILE,
 	ATTACHMENT_LABEL_MCP_PROMPT,
 	ATTACHMENT_LABEL_MCP_RESOURCE,
+	REASONING_BOUNDARY,
 	RETRACTION_TAG,
 	LEGACY_AGENTIC_REGEX
 } from '$lib/constants';
@@ -15,7 +16,17 @@ import {
 	ReasoningFormat,
 	UrlProtocol
 } from '$lib/enums';
-import type { ApiChatMessageContentPart, ApiChatCompletionToolCall } from '$lib/types/api';
+import type {
+	ApiChatMessageContentPart,
+	ApiChatCompletionToolCall,
+	ApiCompactionMetadata,
+	ApiToolStatusEvent,
+	ApiToolArgStreamEvent,
+	ApiToolArtifactsEvent,
+	ApiRetractionEvent,
+	ApiSourcesEvent,
+	ApiToolHealthEvent
+} from '$lib/types/api';
 import type { DatabaseMessageExtraMcpPrompt, DatabaseMessageExtraMcpResource } from '$lib/types';
 import { modelsStore } from '$lib/stores/models.svelte';
 
@@ -81,7 +92,6 @@ export class ChatService {
 	static async sendMessage(
 		messages: ApiChatMessageData[] | (DatabaseMessage & { extra?: DatabaseMessageExtra[] })[],
 		options: SettingsChatServiceOptions = {},
-		conversationId?: string,
 		signal?: AbortSignal
 	): Promise<string | void> {
 		const {
@@ -93,6 +103,13 @@ export class ChatService {
 			onToolCallChunk,
 			onModel,
 			onTimings,
+			onCompaction,
+			onToolStatus,
+			onRetraction,
+			onSources,
+			onToolHealth,
+			onToolArtifacts,
+			onToolArgStream,
 			// Tools for function calling
 			tools,
 			// Generation parameters
@@ -124,7 +141,9 @@ export class ChatService {
 			// Config options
 			disableReasoningParsing,
 			excludeReasoningFromContext,
-			enableThinking
+			enableThinking,
+			preserveThinking,
+			codeExecSessionId
 		} = options;
 
 		const normalizedMessages: ApiChatMessageData[] = messages
@@ -200,6 +219,7 @@ export class ChatService {
 			: ReasoningFormat.AUTO;
 
 		if (enableThinking !== undefined) requestBody.enable_thinking = enableThinking;
+		if (preserveThinking !== undefined) requestBody.preserve_thinking = preserveThinking;
 		if (temperature !== undefined) requestBody.temperature = temperature;
 		if (max_tokens !== undefined) {
 			// Set max_tokens to -1 (infinite) when explicitly configured as 0 or null
@@ -245,9 +265,14 @@ export class ChatService {
 		}
 
 		try {
+			const headers: Record<string, string> = stream ? getStreamHeaders() : getJsonHeaders();
+			if (codeExecSessionId) {
+				headers['X-Code-Exec-Session'] = codeExecSessionId;
+			}
+
 			const response = await fetch(`./v1/chat/completions`, {
 				method: 'POST',
-				headers: getJsonHeaders(),
+				headers,
 				body: JSON.stringify(requestBody),
 				signal
 			});
@@ -265,14 +290,22 @@ export class ChatService {
 			if (stream) {
 				await ChatService.handleStreamResponse(
 					response,
-					onChunk,
-					onComplete,
-					onError,
-					onReasoningChunk,
-					onToolCallChunk,
-					onModel,
-					onTimings,
-					conversationId,
+					{
+						onChunk,
+						onComplete,
+						onError,
+						onReasoningChunk,
+						onToolCallChunk,
+						onModel,
+						onTimings,
+						onCompaction,
+						onToolStatus,
+						onRetraction,
+						onSources,
+						onToolHealth,
+						onToolArtifacts,
+						onToolArgStream
+					},
 					signal
 				);
 
@@ -445,21 +478,46 @@ export class ChatService {
 	 */
 	private static async handleStreamResponse(
 		response: Response,
-		onChunk?: (chunk: string) => void,
-		onComplete?: (
-			response: string,
-			reasoningContent?: string,
-			timings?: ChatMessageTimings,
-			toolCalls?: string
-		) => void,
-		onError?: (error: Error) => void,
-		onReasoningChunk?: (chunk: string) => void,
-		onToolCallChunk?: (chunk: string) => void,
-		onModel?: (model: string) => void,
-		onTimings?: (timings?: ChatMessageTimings, promptProgress?: ChatMessagePromptProgress) => void,
-		conversationId?: string,
+		callbacks: {
+			onChunk?: (chunk: string) => void;
+			onComplete?: (
+				response: string,
+				reasoningContent?: string,
+				timings?: ChatMessageTimings,
+				toolCalls?: string
+			) => void;
+			onError?: (error: Error) => void;
+			onReasoningChunk?: (chunk: string) => void;
+			onToolCallChunk?: (chunk: string) => void;
+			onModel?: (model: string) => void;
+			onTimings?: (timings?: ChatMessageTimings, promptProgress?: ChatMessagePromptProgress) => void;
+			onCompaction?: (metadata: ApiCompactionMetadata) => void;
+			onToolStatus?: (event: ApiToolStatusEvent) => void;
+			onRetraction?: (event: ApiRetractionEvent) => void;
+			onSources?: (event: ApiSourcesEvent) => void;
+			onToolHealth?: (event: ApiToolHealthEvent) => void;
+			onToolArtifacts?: (event: ApiToolArtifactsEvent) => void;
+			onToolArgStream?: (event: ApiToolArgStreamEvent) => void;
+		},
 		abortSignal?: AbortSignal
 	): Promise<void> {
+		const {
+			onChunk,
+			onComplete,
+			onError,
+			onReasoningChunk,
+			onToolCallChunk,
+			onModel,
+			onTimings,
+			onCompaction,
+			onToolStatus,
+			onRetraction,
+			onSources,
+			onToolHealth,
+			onToolArtifacts,
+			onToolArgStream
+		} = callbacks;
+
 		const reader = response.body?.getReader();
 
 		if (!reader) {
@@ -517,8 +575,50 @@ export class ChatService {
 			}
 		};
 
+		// Typed SSE event routing.  When the server emits an `event: <type>\n`
+		// line preceding its `data: <json>\n` payload, dispatch the parsed
+		// payload to the typed callback rather than treating it as a chat
+		// completion chunk.  Activated by the X-Stream-Features header.
+		const EVENT_PREFIX = 'event: ';
+		const routeTypedEvent = (eventType: string, data: string) => {
+			try {
+				const payload = JSON.parse(data);
+				switch (eventType) {
+					case 'tool_status':
+						onToolStatus?.(payload as ApiToolStatusEvent);
+						break;
+					case 'retraction':
+						onRetraction?.(payload as ApiRetractionEvent);
+						break;
+					case 'compaction':
+						onCompaction?.(payload as ApiCompactionMetadata);
+						break;
+					case 'sources':
+						onSources?.(payload as ApiSourcesEvent);
+						break;
+					case 'tool_health':
+						onToolHealth?.(payload as ApiToolHealthEvent);
+						break;
+					case 'tool_artifacts':
+						onToolArtifacts?.(payload as ApiToolArtifactsEvent);
+						break;
+					case 'tool_arg_stream':
+						onToolArgStream?.(payload as ApiToolArgStreamEvent);
+						break;
+					default:
+						if (import.meta.env.DEV) {
+							console.warn('[ChatService] Unknown SSE event type:', eventType);
+						}
+				}
+			} catch (e) {
+				console.error('[ChatService] Error parsing typed SSE event:', eventType, e);
+			}
+		};
+
 		try {
 			let chunk = '';
+			let pendingEventType: string | null = null;
+
 			while (true) {
 				if (abortSignal?.aborted) break;
 
@@ -534,8 +634,23 @@ export class ChatService {
 				for (const line of lines) {
 					if (abortSignal?.aborted) break;
 
+					// Typed SSE event marker — the next `data:` line carries its payload.
+					if (line.startsWith(EVENT_PREFIX)) {
+						pendingEventType = line.slice(EVENT_PREFIX.length).trim();
+						continue;
+					}
+
 					if (line.startsWith(UrlProtocol.DATA)) {
 						const data = line.slice(6);
+
+						// Route typed SSE event payloads to their handlers and skip
+						// the standard chat-completion processing below.
+						if (pendingEventType) {
+							routeTypedEvent(pendingEventType, data);
+							pendingEventType = null;
+							continue;
+						}
+
 						if (data === '[DONE]') {
 							streamFinished = true;
 
@@ -797,7 +912,7 @@ export class ChatService {
 			};
 
 			if (message.reasoningContent) {
-				result.reasoning_content = message.reasoningContent;
+				result.reasoning_content = message.reasoningContent.replaceAll(REASONING_BOUNDARY, '');
 			}
 
 			if (toolCalls && toolCalls.length > 0) {
@@ -929,7 +1044,7 @@ export class ChatService {
 			content: contentParts
 		};
 		if (message.reasoningContent) {
-			result.reasoning_content = message.reasoningContent;
+			result.reasoning_content = message.reasoningContent.replaceAll(REASONING_BOUNDARY, '');
 		}
 		if (toolCalls && toolCalls.length > 0) {
 			result.tool_calls = toolCalls;

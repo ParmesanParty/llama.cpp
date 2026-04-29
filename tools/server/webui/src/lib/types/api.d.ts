@@ -215,6 +215,7 @@ export interface ApiChatCompletionRequest {
 	// Reasoning parameters
 	reasoning_format?: string;
 	enable_thinking?: boolean;
+	preserve_thinking?: boolean;
 	// Generation parameters
 	temperature?: number;
 	max_tokens?: number;
@@ -319,6 +320,16 @@ export interface ApiToolArtifactsEvent {
 	call_id: string;
 	iteration: number;
 	artifact: ApiToolArtifactPayload;
+}
+
+export interface ApiToolArgStreamEvent {
+	call_id: string;
+	phase: 'started' | 'delta' | 'completed';
+	tool?: string; // present on 'started'
+	index?: number; // present on 'started'
+	iteration?: number; // present on 'started'
+	field?: string; // present on 'delta'
+	text?: string; // present on 'delta'
 }
 
 export interface ApiChatCompletionStreamChunk {

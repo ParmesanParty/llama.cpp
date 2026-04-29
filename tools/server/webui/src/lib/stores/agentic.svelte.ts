@@ -613,7 +613,6 @@ class AgenticStore {
 							throw error;
 						}
 					},
-					undefined,
 					signal
 				);
 

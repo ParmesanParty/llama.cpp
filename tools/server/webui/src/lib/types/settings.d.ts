@@ -5,6 +5,8 @@ import type { DatabaseMessageExtra } from './database';
 import type {
 	ApiCompactionMetadata,
 	ApiToolStatusEvent,
+	ApiToolArgStreamEvent,
+	ApiToolArtifactsEvent,
 	ApiRetractionEvent,
 	ApiSourcesEvent,
 	ApiToolHealthEvent
@@ -36,6 +38,10 @@ export interface SettingsChatServiceOptions {
 	tools?: OpenAIToolDefinition[];
 	// Enable extended thinking
 	enableThinking?: boolean;
+	// Preserve prior reasoning blocks across turns (sent as preserve_thinking)
+	preserveThinking?: boolean;
+	// Per-conversation code_exec session id (sent as X-Code-Exec-Session header)
+	codeExecSessionId?: string;
 	// Generation parameters
 	temperature?: number;
 	max_tokens?: number;
@@ -82,6 +88,8 @@ export interface SettingsChatServiceOptions {
 	onRetraction?: (event: ApiRetractionEvent) => void;
 	onSources?: (event: ApiSourcesEvent) => void;
 	onToolHealth?: (event: ApiToolHealthEvent) => void;
+	onToolArtifacts?: (event: ApiToolArtifactsEvent) => void;
+	onToolArgStream?: (event: ApiToolArgStreamEvent) => void;
 }
 
 export type SettingsConfigType = typeof SETTING_CONFIG_DEFAULT & {
