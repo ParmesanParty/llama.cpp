@@ -1,6 +1,9 @@
-import { getJsonHeaders, getStreamHeaders } from '$lib/utils/api-headers';
+import { getJsonHeaders } from '$lib/utils/api-headers';
 import { formatAttachmentText } from '$lib/utils/formatters';
 import { isAbortError } from '$lib/utils/abort';
+import { mergedOrchestrationStore } from '$lib/stores/merged-orchestration.svelte';
+import { buildChatRequest } from './chat-request-builder';
+import { shouldRetryAfter410 } from './chat-410-recovery';
 import {
 	ATTACHMENT_LABEL_PDF_FILE,
 	ATTACHMENT_LABEL_MCP_PROMPT,
@@ -265,17 +268,48 @@ export class ChatService {
 		}
 
 		try {
-			const headers: Record<string, string> = stream ? getStreamHeaders() : getJsonHeaders();
-			if (codeExecSessionId) {
-				headers['X-Code-Exec-Session'] = codeExecSessionId;
-			}
+			// Cover cold-start ($effect-fire to fetch-resolve) and any in-flight
+			// reconcile race so we don't snapshot sessionId === null and degrade
+			// silently to a tools-bearing no-session request.
+			await mergedOrchestrationStore.waitUntilReady();
 
-			const response = await fetch(`./v1/chat/completions`, {
-				method: 'POST',
-				headers,
-				body: JSON.stringify(requestBody),
-				signal
+			let { url, init } = buildChatRequest({
+				requestBody: requestBody as unknown as Record<string, unknown>,
+				stream: stream ?? false,
+				codeExecSessionId,
+				signal,
+				sessionId: mergedOrchestrationStore.sessionId,
+				sessionToken: mergedOrchestrationStore.sessionToken
 			});
+			let response = await fetch(url, init);
+
+			if (response.status === 410) {
+				// Server has no record of our session_id (typically a proxy
+				// restart). Re-register and retry exactly once, but only when
+				// the body indicates session_not_found — other 410s are
+				// permanent and should surface as errors.
+				const bodyText = await response.clone().text();
+				if (shouldRetryAfter410(response.status, bodyText)) {
+					const replaced = await mergedOrchestrationStore.reconcile();
+					if (replaced) {
+						({ url, init } = buildChatRequest({
+							requestBody: requestBody as unknown as Record<string, unknown>,
+							stream: stream ?? false,
+							codeExecSessionId,
+							signal,
+							sessionId: mergedOrchestrationStore.sessionId,
+							sessionToken: mergedOrchestrationStore.sessionToken
+						}));
+						response = await fetch(url, init);
+					} else {
+						// Reconcile failed (network/HTTP error). Atomic-swap kept
+						// the old session in the store, but the proxy's 410 told
+						// us it's dead — keeping it would loop on 410. Null it
+						// explicitly so the next request falls back to no-session.
+						mergedOrchestrationStore.closeSession();
+					}
+				}
+			}
 
 			if (!response.ok) {
 				const error = await ChatService.parseErrorResponse(response);
