@@ -560,7 +560,6 @@ export class ChatService {
 			throw new Error('No response body');
 		}
 
-		const decoder = new TextDecoder();
 		let aggregatedContent = '';
 		let fullReasoningContent = '';
 		let aggregatedToolCalls: ApiChatCompletionToolCall[] = [];
@@ -569,6 +568,31 @@ export class ChatService {
 		let modelEmitted = false;
 		let toolCallIndexOffset = 0;
 		let hasOpenToolCallBatch = false;
+
+		// SSE reconnection tracking. lastEventId is sent back as Last-Event-Id
+		// when resuming; activeRequestId is derived from the first
+		// correlation_id we observe (proxy emits "<request_id>.<call_id>").
+		let lastEventId = '-1';
+		let activeRequestId: string | null = null;
+
+		// Per-correlation-ID dispatch state to deduplicate re-emitted
+		// tool-execute events after SSE reconnection. The proxy may re-fire
+		// events the webui already handled; we either no-op (in flight) or
+		// re-POST the cached payload (already done).
+		interface ToolCallbackBody {
+			ok: boolean;
+			content: string;
+			sources: unknown[];
+			artifacts: unknown[];
+			error_code: string | null;
+			client_latency_ms: number;
+		}
+		type DispatchState = 'dispatching' | 'completed' | 'failed';
+		interface DispatchEntry {
+			state: DispatchState;
+			result?: ToolCallbackBody;
+		}
+		const dispatchStateMap = new Map<string, DispatchEntry>();
 
 		const finalizeOpenToolCallBatch = () => {
 			if (!hasOpenToolCallBatch) {
@@ -616,6 +640,7 @@ export class ChatService {
 		// payload to the typed callback rather than treating it as a chat
 		// completion chunk.  Activated by the X-Stream-Features header.
 		const EVENT_PREFIX = 'event: ';
+		const ID_PREFIX = 'id: ';
 		const routeTypedEvent = (eventType: string, data: string) => {
 			try {
 				const payload = JSON.parse(data);
@@ -665,10 +690,35 @@ export class ChatService {
 			}
 		};
 
+		const postToolCallback = async (
+			sid: string,
+			token: string,
+			corrId: string,
+			body: ToolCallbackBody,
+			label: string
+		): Promise<void> => {
+			try {
+				await fetch(`${base}/api/tool-callback/${sid}/${corrId}`, {
+					method: 'POST',
+					headers: {
+						'Content-Type': 'application/json',
+						'X-Session-Token': token
+					},
+					body: JSON.stringify(body)
+				});
+			} catch (e) {
+				console.warn(`[ChatService] tool-callback ${label} failed`, e);
+			}
+		};
+
 		// Merged-orchestration tool dispatch. The proxy emits a `tool-execute`
 		// event per client tool call it wants the webui to handle (MCP tools
 		// live in the browser); we run the call locally and POST the result
 		// back to /api/tool-callback so the proxy can resume the unified loop.
+		//
+		// dispatchStateMap keys events by correlation_id: in-flight no-ops,
+		// completed/failed re-POST the cached payload — covers the case where
+		// SSE reconnect causes the proxy to re-emit events we already handled.
 		const handleToolExecuteEvent = async (data: {
 			correlation_id: string;
 			name: string;
@@ -682,15 +732,31 @@ export class ChatService {
 				console.warn('[ChatService] tool-execute received but no session registered');
 				return;
 			}
+
+			// Derive request_id from the first correlation_id we see — needed
+			// later as the X-Resume-Request value if the stream drops.
+			if (!activeRequestId) {
+				activeRequestId = data.correlation_id.split('.')[0];
+			}
+
+			const corrId = data.correlation_id;
+			const existing = dispatchStateMap.get(corrId);
+
+			if (existing) {
+				if (existing.state === 'dispatching') {
+					// In-flight — let the original call finish naturally.
+					return;
+				}
+				if (existing.result) {
+					await postToolCallback(sid, token, corrId, existing.result, 're-POST');
+				}
+				return;
+			}
+
+			dispatchStateMap.set(corrId, { state: 'dispatching' });
+
 			const startedAt = performance.now();
-			let body: {
-				ok: boolean;
-				content: string;
-				sources: unknown[];
-				artifacts: unknown[];
-				error_code: string | null;
-				client_latency_ms: number;
-			};
+			let body: ToolCallbackBody;
 			try {
 				const result = await mcpStore.executeToolByName(data.tool_name_local, data.args);
 				body = {
@@ -701,6 +767,7 @@ export class ChatService {
 					error_code: result.isError ? 'tool_error' : null,
 					client_latency_ms: Math.round(performance.now() - startedAt)
 				};
+				dispatchStateMap.set(corrId, { state: 'completed', result: body });
 			} catch (e) {
 				console.warn('[ChatService] tool-execute dispatch failed', e);
 				body = {
@@ -711,19 +778,9 @@ export class ChatService {
 					error_code: 'tool_error',
 					client_latency_ms: Math.round(performance.now() - startedAt)
 				};
+				dispatchStateMap.set(corrId, { state: 'failed', result: body });
 			}
-			try {
-				await fetch(`${base}/api/tool-callback/${sid}/${data.correlation_id}`, {
-					method: 'POST',
-					headers: {
-						'Content-Type': 'application/json',
-						'X-Session-Token': token
-					},
-					body: JSON.stringify(body)
-				});
-			} catch (e) {
-				console.warn('[ChatService] tool-callback POST failed', e);
-			}
+			await postToolCallback(sid, token, corrId, body, 'POST');
 		};
 
 		const handleToolExecuteCancelEvent = (data: { correlation_id: string }): void => {
@@ -732,24 +789,37 @@ export class ChatService {
 			console.info('[ChatService] tool-execute-cancel', data.correlation_id);
 		};
 
-		try {
+		// Inner read-loop: drains a single SSE reader into the closure-scope
+		// stream state. Used for both the primary stream and any reconnect.
+		// decoder is fresh per invocation so reconnect doesn't inherit half-
+		// decoded UTF-8 bytes from the dropped stream.
+		const drainReader = async (
+			r: ReadableStreamDefaultReader<Uint8Array>
+		): Promise<void> => {
+			const decoder = new TextDecoder();
 			let chunk = '';
 			let pendingEventType: string | null = null;
 
 			while (true) {
-				if (abortSignal?.aborted) break;
+				if (abortSignal?.aborted) return;
 
-				const { done, value } = await reader.read();
-				if (done) break;
+				const { done, value } = await r.read();
+				if (done) return;
 
-				if (abortSignal?.aborted) break;
+				if (abortSignal?.aborted) return;
 
 				chunk += decoder.decode(value, { stream: true });
 				const lines = chunk.split('\n');
 				chunk = lines.pop() || '';
 
 				for (const line of lines) {
-					if (abortSignal?.aborted) break;
+					if (abortSignal?.aborted) return;
+
+					// SSE id: line — track Last-Event-Id for reconnection.
+					if (line.startsWith(ID_PREFIX)) {
+						lastEventId = line.slice(ID_PREFIX.length).trim();
+						continue;
+					}
 
 					// Typed SSE event marker — the next `data:` line carries its payload.
 					if (line.startsWith(EVENT_PREFIX)) {
@@ -821,7 +891,90 @@ export class ChatService {
 					}
 				}
 
-				if (abortSignal?.aborted) break;
+				if (abortSignal?.aborted) return;
+			}
+		};
+
+		// Single-shot reconnect: POST /v1/chat/completions with X-Resume-Request +
+		// Last-Event-Id. Server resumes from the cached event tail; 410/412 means
+		// either the request id is unknown (proxy restart) or the event id is
+		// past the cache window — abandon either way.
+		const reconnectStream = async (
+			requestId: string,
+			eventId: string
+		): Promise<void> => {
+			const sid = mergedOrchestrationStore.sessionId;
+			const token = mergedOrchestrationStore.sessionToken;
+			if (!sid || !token) {
+				console.warn('[ChatService] reconnectStream: no session, cannot resume');
+				return;
+			}
+			console.info('[ChatService] Reconnecting stream', { requestId, eventId });
+			let resumeResponse: Response;
+			try {
+				resumeResponse = await fetch(`./v1/chat/completions`, {
+					method: 'POST',
+					headers: {
+						'Content-Type': 'application/json',
+						'X-Session-Token': token,
+						'X-Resume-Request': requestId,
+						'Last-Event-Id': eventId,
+						Accept: 'text/event-stream'
+					},
+					body: JSON.stringify({ messages: [], session_id: sid, stream: true }),
+					signal: abortSignal
+				});
+			} catch (e) {
+				console.warn('[ChatService] reconnectStream: fetch failed', e);
+				return;
+			}
+			if (resumeResponse.status === 410 || resumeResponse.status === 412) {
+				console.warn(
+					'[ChatService] reconnectStream: server rejected resume',
+					resumeResponse.status
+				);
+				return;
+			}
+			// Best-effort resume: any non-OK response (5xx, 4xx other than the
+			// expected 410/412 reject codes) is treated as "abandon silently".
+			// Without this guard a 500 would feed an HTML/JSON error body into
+			// drainReader's SSE parser, throwing and surfacing as an onError
+			// dialog — not the recovery semantics we want.
+			if (!resumeResponse.ok) {
+				console.warn(
+					'[ChatService] reconnectStream: non-OK resume response',
+					resumeResponse.status
+				);
+				return;
+			}
+			const resumeReader = resumeResponse.body?.getReader();
+			if (!resumeReader) {
+				console.warn('[ChatService] reconnectStream: no response body');
+				return;
+			}
+			try {
+				await drainReader(resumeReader);
+			} finally {
+				resumeReader.releaseLock();
+			}
+		};
+
+		try {
+			try {
+				await drainReader(reader);
+			} catch (streamError) {
+				if (!abortSignal?.aborted && activeRequestId) {
+					console.warn(
+						'[ChatService] Stream dropped, attempting reconnect',
+						streamError
+					);
+					await reconnectStream(activeRequestId, lastEventId);
+				} else {
+					// No reconnect path available (no tool-execute observed yet
+					// and therefore no request_id to resume). Surface the error
+					// through the normal onError path instead of swallowing.
+					throw streamError;
+				}
 			}
 
 			if (abortSignal?.aborted) return;
