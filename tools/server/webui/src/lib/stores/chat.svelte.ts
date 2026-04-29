@@ -38,6 +38,8 @@ import {
 	INACTIVE_CONVERSATION_STATE_MAX_AGE_MS,
 	SYSTEM_MESSAGE_PLACEHOLDER
 } from '$lib/constants';
+import { REASONING_BOUNDARY } from '$lib/constants/agentic';
+import { createStreamEventHandlers } from '$lib/stores/stream-event-handlers';
 import type {
 	ChatMessageTimings,
 	ChatMessagePromptProgress,
@@ -45,15 +47,14 @@ import type {
 	ErrorDialogState
 } from '$lib/types/chat';
 import type {
-	ApiCompactionMetadata,
 	ApiProcessingState,
 	ApiToolArgStreamEvent,
-	ApiToolArtifactsEvent,
 	ConversationCompaction,
 	DatabaseMessage,
-	DatabaseMessageExtra
+	DatabaseMessageExtra,
+	StreamEvent
 } from '$lib/types';
-import { AttachmentType, ErrorDialogType, MessageRole, MessageType } from '$lib/enums';
+import { ErrorDialogType, MessageRole, MessageType } from '$lib/enums';
 
 interface ConversationStateEntry {
 	lastAccessed: number;
@@ -627,6 +628,7 @@ class ChatStore {
 		let currentMessageId = assistantMessage.id;
 		let streamedContent = '';
 		let streamedReasoningContent = '';
+		let reasoningBoundaryOffset = 0;
 		let resolvedModel: string | null = null;
 		let modelPersisted = false;
 		const convId = assistantMessage.convId;
@@ -635,6 +637,10 @@ class ChatStore {
 		// THIS array (which may have been transformed by buildCompactedMessages),
 		// not the full activeMessages history.
 		let sentMessages: DatabaseMessage[] | null = null;
+		// Typed SSE events accumulated for the current assistant message.
+		// Mutated in-place by stream-event-handlers; cleared on createAssistantMessage
+		// turn boundaries so per-turn messages get their own slice.
+		const streamedEvents: StreamEvent[] = [];
 
 		const recordModel = (modelName: string | null | undefined, persistImmediately = true): void => {
 			if (!modelName) return;
@@ -656,6 +662,24 @@ class ChatStore {
 			this.setChatStreaming(convId, streamedContent, currentMessageId);
 			const idx = conversationsStore.findMessageIndex(currentMessageId);
 			conversationsStore.updateMessageAtIndex(idx, { content: streamedContent });
+		};
+
+		// Visible content length — used as the offset of typed SSE events so
+		// ChatMessageStreamContent can interleave tool steps and retraction
+		// blocks against rendered markdown. Reasoning streams via a separate
+		// SSE channel and is never present in streamedContent.
+		const contentOffset = (): number => streamedContent.length;
+
+		// Close the open reasoning block before tool execution begins so the
+		// renderer can split per-iteration reasoning blocks. Inserted at the
+		// boundary only if new reasoning arrived since the last marker.
+		const finalizeReasoning = () => {
+			if (!streamedReasoningContent) return;
+			if (streamedReasoningContent.length <= reasoningBoundaryOffset) return;
+			streamedReasoningContent += REASONING_BOUNDARY;
+			reasoningBoundaryOffset = streamedReasoningContent.length;
+			const idx = conversationsStore.findMessageIndex(currentMessageId);
+			conversationsStore.updateMessageAtIndex(idx, { reasoningContent: streamedReasoningContent });
 		};
 
 		// Append extras onto a message and persist.  Shared between the
@@ -683,6 +707,21 @@ class ChatStore {
 		this.setStreamingActive(true);
 		this.setActiveProcessingConversation(convId);
 		const abortController = this.getOrCreateAbortController(convId);
+
+		const { handlers: typedEventHandlers, cancelPendingFlush } = createStreamEventHandlers({
+			streamedEvents,
+			contentOffset,
+			finalizeReasoning,
+			updateStreamingContent: updateStreamingUI,
+			findMessageIndex: (id) => conversationsStore.findMessageIndex(id),
+			updateMessageAtIndex: (idx, data) => conversationsStore.updateMessageAtIndex(idx, data),
+			getCurrentMessageId: () => currentMessageId,
+			sentMessages: () => sentMessages,
+			activeMessages: () => conversationsStore.activeMessages,
+			activeConversation: () => conversationsStore.activeConversation,
+			setCompaction: (c) => conversationsStore.setCompaction(c),
+			onAttachments: pushExtras
+		});
 
 		const streamCallbacks: ChatStreamCallbacks = {
 			onChunk: (chunk: string) => {
@@ -731,6 +770,12 @@ class ChatStore {
 				timings: ChatMessageTimings | undefined,
 				toolCalls: import('$lib/types/api').ApiChatCompletionToolCall[] | undefined
 			) => {
+				// Cancel any rAF flush queued by a final SSE event from this turn —
+				// we're persisting the canonical streamedEvents below; a delayed
+				// flush would duplicate the write or (worse) fire after the next
+				// turn's createAssistantMessage clears streamedEvents and reads
+				// the new currentMessageId, stomping the new message's UI state.
+				cancelPendingFlush();
 				const updateData: Record<string, unknown> = {
 					content,
 					reasoningContent: reasoningContent || undefined,
@@ -738,6 +783,7 @@ class ChatStore {
 					timings
 				};
 				if (resolvedModel && !modelPersisted) updateData.model = resolvedModel;
+				if (streamedEvents.length > 0) updateData.streamEvents = [...streamedEvents];
 				await DatabaseService.updateMessage(currentMessageId, updateData);
 				const idx = conversationsStore.findMessageIndex(currentMessageId);
 				const uiUpdate: Partial<DatabaseMessage> = {
@@ -747,6 +793,7 @@ class ChatStore {
 				};
 				if (timings) uiUpdate.timings = timings;
 				if (resolvedModel) uiUpdate.model = resolvedModel;
+				if (streamedEvents.length > 0) uiUpdate.streamEvents = [...streamedEvents];
 				conversationsStore.updateMessageAtIndex(idx, uiUpdate);
 				await conversationsStore.updateCurrentNode(currentMessageId);
 			},
@@ -774,9 +821,17 @@ class ChatStore {
 				return msg;
 			},
 			createAssistantMessage: async () => {
+				// Cancel any rAF flush queued from the previous turn. After
+				// streamedEvents.length=0 + currentMessageId reassignment below,
+				// a deferred rAF would write an empty event array against the
+				// new message id, wiping any events we accumulate before the
+				// rAF paints.
+				cancelPendingFlush();
 				// Reset streaming state for new message
 				streamedContent = '';
 				streamedReasoningContent = '';
+				reasoningBoundaryOffset = 0;
+				streamedEvents.length = 0;
 
 				const lastMsg =
 					conversationsStore.activeMessages[conversationsStore.activeMessages.length - 1];
@@ -851,43 +906,7 @@ class ChatStore {
 				});
 				if (onError) onError(error);
 			},
-			onCompaction: (metadata: ApiCompactionMetadata) => {
-				// metadata.compacted_up_to_index references positions in the
-				// messages array we sent (sentMessages), not the full
-				// activeMessages history.  If the boundary lands on the synthetic
-				// "compaction-summary" message, advance to the first real message
-				// after it so the banner anchors to a persisted message id.
-				const msgs = sentMessages ?? conversationsStore.activeMessages;
-				const boundaryMsg = msgs[metadata.compacted_up_to_index];
-				if (!boundaryMsg || !conversationsStore.activeConversation) return;
-				const resolvedId =
-					boundaryMsg.id === 'compaction-summary'
-						? msgs[metadata.compacted_up_to_index + 1]?.id
-						: boundaryMsg.id;
-				if (!resolvedId) return;
-				conversationsStore.setCompaction({
-					summary: metadata.summary,
-					compactedUpToMessageId: resolvedId,
-					compactedMessageCount: metadata.compacted_message_count,
-					timestamp: Date.now()
-				});
-			},
-			onToolArtifacts: (event: ApiToolArtifactsEvent) => {
-				// Map the artifact payload to a DatabaseMessageExtraImageFile
-				// and attach it to the assistant message currently streaming.
-				// Non-image artifact kinds short-circuit (no other kinds shipped
-				// yet — kept as a guard for forward compatibility).
-				if (event.artifact.kind !== 'image') return;
-				const extra: DatabaseMessageExtra = {
-					type: AttachmentType.IMAGE,
-					name: event.artifact.name,
-					base64Url: `data:${event.artifact.mime};base64,${event.artifact.data_b64}`,
-					...(event.artifact.width !== undefined ? { width: event.artifact.width } : {}),
-					...(event.artifact.height !== undefined ? { height: event.artifact.height } : {}),
-					...(event.artifact.url ? { url: event.artifact.url } : {})
-				};
-				pushExtras(currentMessageId, [extra]);
-			},
+			...typedEventHandlers,
 			onToolArgStream: (_event: ApiToolArgStreamEvent) => {
 				// Wire-only landing zone. The proxy emits per-call_id
 				// started/delta/completed events for in-flight tool args
@@ -901,6 +920,23 @@ class ChatStore {
 		};
 
 		const perChatOverrides = conversationsStore.activeConversation?.mcpServerOverrides;
+
+		// Compute the canonical send-list once so both code paths (agentic
+		// flow + non-agentic ChatService.sendMessage) can share it. Setting
+		// sentMessages before runAgenticFlow lets the typed onCompaction
+		// handler resolve a turn-1 compaction event's index correctly even
+		// in the agentic path. (Mid-agentic-loop compaction events on turn
+		// 2+ still resolve against this turn-1 snapshot, which is a known
+		// degraded case — the proxy's compacted_up_to_index references the
+		// per-turn array, which differs once agentic appends tool result
+		// messages. Acceptable as compaction typically fires once early in
+		// a conversation, and merged-orch — the dominant production path —
+		// never enters the agentic branch in the first place.)
+		const priorCompaction = conversationsStore.activeConversation?.compaction;
+		const messagesToSend = priorCompaction
+			? this.buildCompactedMessages(allMessages, priorCompaction)
+			: allMessages;
+		sentMessages = messagesToSend;
 
 		{
 			const agenticResult = await agenticStore.runAgenticFlow({
@@ -920,15 +956,6 @@ class ChatStore {
 				return;
 			}
 		}
-
-		// Replace history with summary + recent if a prior compaction was
-		// recorded for this conversation.  sentMessages tracks what we
-		// actually transmit so onCompaction can resolve indices correctly.
-		const priorCompaction = conversationsStore.activeConversation?.compaction;
-		const messagesToSend = priorCompaction
-			? this.buildCompactedMessages(allMessages, priorCompaction)
-			: allMessages;
-		sentMessages = messagesToSend;
 
 		await ChatService.sendMessage(
 			messagesToSend,
@@ -962,6 +989,7 @@ class ChatStore {
 						timings
 					};
 					if (resolvedModel && !modelPersisted) updateData.model = resolvedModel;
+					if (streamedEvents.length > 0) updateData.streamEvents = [...streamedEvents];
 					await DatabaseService.updateMessage(currentMessageId, updateData);
 					const idx = conversationsStore.findMessageIndex(currentMessageId);
 					const uiUpdate: Partial<DatabaseMessage> = {
@@ -971,6 +999,7 @@ class ChatStore {
 					};
 					if (timings) uiUpdate.timings = timings;
 					if (resolvedModel) uiUpdate.model = resolvedModel;
+					if (streamedEvents.length > 0) uiUpdate.streamEvents = [...streamedEvents];
 					conversationsStore.updateMessageAtIndex(idx, uiUpdate);
 					await conversationsStore.updateCurrentNode(currentMessageId);
 					cleanupStreamingState();

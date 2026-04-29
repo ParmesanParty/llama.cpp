@@ -43,6 +43,8 @@ export interface DatabaseMessageExtraImageFile {
 	type: AttachmentType.IMAGE;
 	name: string;
 	size?: number;
+	/** Optional human label (rendered as img alt + chip caption); defaults to name. */
+	alt?: string;
 	base64Url: string;
 	width?: number;
 	height?: number;

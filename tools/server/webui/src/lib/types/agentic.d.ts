@@ -4,7 +4,14 @@ import type {
 	ApiChatCompletionRequest,
 	ApiChatCompletionToolCall,
 	ApiChatMessageContentPart,
-	ApiChatMessageData
+	ApiChatMessageData,
+	ApiCompactionMetadata,
+	ApiToolStatusEvent,
+	ApiRetractionEvent,
+	ApiSourcesEvent,
+	ApiToolHealthEvent,
+	ApiToolArtifactsEvent,
+	ApiToolArgStreamEvent
 } from './api';
 import type { ChatMessageTimings, ChatMessagePromptProgress } from './chat';
 import type { DatabaseMessage, DatabaseMessageExtra, McpServerOverride } from './database';
@@ -116,6 +123,18 @@ export interface AgenticFlowCallbacks {
 	onTimings?: (timings?: ChatMessageTimings, promptProgress?: ChatMessagePromptProgress) => void;
 	/** An agentic turn (LLM + tool execution) completed - intermediate timing update */
 	onTurnComplete?: (intermediateTimings: ChatMessageTimings) => void;
+	/**
+	 * Typed SSE events forwarded per turn through ChatService.sendMessage. The
+	 * agentic flow is a transparent conduit; the chat-store's stream-event
+	 * accumulator (closure-captured across turns) handles persistence.
+	 */
+	onCompaction?: (metadata: ApiCompactionMetadata) => void;
+	onToolStatus?: (event: ApiToolStatusEvent) => void;
+	onRetraction?: (event: ApiRetractionEvent) => void;
+	onSources?: (event: ApiSourcesEvent) => void;
+	onToolHealth?: (event: ApiToolHealthEvent) => void;
+	onToolArtifacts?: (event: ApiToolArtifactsEvent) => void;
+	onToolArgStream?: (event: ApiToolArgStreamEvent) => void;
 }
 
 /**

@@ -495,7 +495,18 @@ class AgenticStore {
 			createAssistantMessage,
 			onFlowComplete,
 			onTimings,
-			onTurnComplete
+			onTurnComplete,
+			// Typed SSE events ride a single stream regardless of which JS path
+			// drives the LLM call. The agentic loop forwards them per-turn so
+			// the chat-store's stream-event accumulator (closure-captured across
+			// turns) can stamp them into DatabaseMessage.streamEvents.
+			onCompaction,
+			onToolStatus,
+			onRetraction,
+			onSources,
+			onToolHealth,
+			onToolArtifacts,
+			onToolArgStream
 		} = callbacks;
 
 		const sessionMessages: AgenticMessage[] = toAgenticMessages(messages);
@@ -566,6 +577,13 @@ class AgenticStore {
 						...options,
 						stream: true,
 						tools: tools.length > 0 ? tools : undefined,
+						onCompaction,
+						onToolStatus,
+						onRetraction,
+						onSources,
+						onToolHealth,
+						onToolArtifacts,
+						onToolArgStream,
 						onChunk: (chunk: string) => {
 							turnContent += chunk;
 							onChunk?.(chunk);

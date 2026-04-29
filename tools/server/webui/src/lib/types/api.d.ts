@@ -301,8 +301,10 @@ export interface ApiToolHealthEvent {
 export interface ApiToolArtifactPayload {
 	/** Discriminator. Currently only "image"; "file" reserved for future use. */
 	kind: 'image' | 'file';
-	/** Display name + img alt text — used as the rehype-resolution key against attachment names. */
+	/** Filename — used as the rehype-resolution key against inline markdown image refs. */
 	name: string;
+	/** Optional human label for chip caption + img alt; falls back to `name` when absent. */
+	alt?: string;
 	/** MIME type, e.g. "image/png". */
 	mime: string;
 	/** Bare base64 payload (no `data:` prefix). The client wraps this in a data URL. */
