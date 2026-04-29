@@ -8,6 +8,7 @@
 		ModelBadge,
 		ModelsSelectorDropdown
 	} from '$lib/components/app';
+	import ChatMessageStreamContent from './ChatMessageStreamContent.svelte';
 	import { getMessageEditContext } from '$lib/contexts';
 	import { useProcessingState } from '$lib/hooks/use-processing-state.svelte';
 	import { isLoading, isChatStreaming } from '$lib/stores/chat.svelte';
@@ -82,6 +83,7 @@
 
 	const isAgentic = $derived(hasAgenticContent(message, toolMessages));
 	const hasReasoning = $derived(!!message.reasoningContent);
+	const hasStreamEvents = $derived((message.streamEvents?.length ?? 0) > 0);
 	const hasRetractionMarker = $derived(messageContent?.includes(RETRACTION_TAG) ?? false);
 	const processingState = useProcessingState();
 
@@ -275,6 +277,14 @@
 	{:else if message.role === MessageRole.ASSISTANT}
 		{#if showRawOutput}
 			<pre class="raw-output">{rawOutputContent || ''}</pre>
+		{:else if hasStreamEvents || hasReasoning}
+			<ChatMessageStreamContent
+				content={messageContent || ''}
+				streamEvents={message.streamEvents ?? []}
+				attachments={message.extra}
+				reasoningContent={message.reasoningContent}
+				isStreaming={isChatStreaming()}
+			/>
 		{:else}
 			<ChatMessageAgenticContent
 				{message}

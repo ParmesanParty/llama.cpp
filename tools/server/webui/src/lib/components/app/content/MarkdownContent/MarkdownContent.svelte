@@ -576,7 +576,18 @@
 		loadHighlightTheme(isDark);
 	});
 
+	// Track sources identity so citation display numbers update when the
+	// final filtered sources SSE replaces the pre-content sources list.
+	let prevSourcesRef: CitationSource[] | undefined;
 	$effect(() => {
+		const sourcesChanged = sources !== prevSourcesRef;
+		prevSourcesRef = sources;
+		if (sourcesChanged && previousContent) {
+			// Sources changed without content change — clear caches and force
+			// a full re-render so citation display numbers match the new footer.
+			transformCache.clear();
+			previousContent = '';
+		}
 		updateRenderedBlocks(content);
 	});
 
@@ -1190,6 +1201,7 @@
 		text-decoration: none;
 		color: var(--primary);
 		font-weight: 600;
+		white-space: nowrap;
 	}
 
 	div :global(.citation-link:hover) {
