@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { Server } from '@lucide/svelte';
 	import { ServerStatus } from '$lib/components/app';
+	import { APP_NAME } from '$lib/constants';
 	import { fade } from 'svelte/transition';
 
 	interface Props {
@@ -8,8 +9,10 @@
 		message?: string;
 	}
 
-	let { class: className = '', message = 'Initializing connection to llama.cpp server...' }: Props =
-		$props();
+	let {
+		class: className = '',
+		message = `Initializing connection to ${APP_NAME} server...`
+	}: Props = $props();
 </script>
 
 <div class="flex h-full items-center justify-center {className}">
