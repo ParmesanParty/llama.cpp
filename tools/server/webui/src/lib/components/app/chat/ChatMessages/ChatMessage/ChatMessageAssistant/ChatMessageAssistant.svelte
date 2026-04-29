@@ -1,5 +1,6 @@
 <script lang="ts">
 	import {
+		ChatAttachmentsList,
 		ChatMessageAgenticContent,
 		ChatMessageActionIcons,
 		ChatMessageEditForm,
@@ -10,8 +11,13 @@
 	import { getMessageEditContext } from '$lib/contexts';
 	import { useProcessingState } from '$lib/hooks/use-processing-state.svelte';
 	import { isLoading, isChatStreaming } from '$lib/stores/chat.svelte';
-	import { copyToClipboard, deriveAgenticSections } from '$lib/utils';
-	import { AgenticSectionType } from '$lib/enums';
+	import {
+		copyToClipboard,
+		deriveAgenticSections,
+		resolveInlineImageSrcs
+	} from '$lib/utils';
+	import { AgenticSectionType, AttachmentType } from '$lib/enums';
+	import type { DatabaseMessageExtra } from '$lib/types';
 	import { REASONING_TAGS } from '$lib/constants/agentic';
 	import { tick } from 'svelte';
 	import { fade } from 'svelte/transition';
@@ -78,6 +84,39 @@
 	const hasReasoning = $derived(!!message.reasoningContent);
 	const hasRetractionMarker = $derived(messageContent?.includes(RETRACTION_TAG) ?? false);
 	const processingState = useProcessingState();
+
+	// Message-level artifact row (footer gallery).  Curation policy: image
+	// artifacts the model embedded inline via markdown image refs
+	// (`![](filename.png)`) or literal `<img src>` URLs are FEATURED — they
+	// render inline in the prose via the rehype attachment-image plugin
+	// and never appear in this row.  Image artifacts NOT inline-referenced
+	// land here.  When at least one image was featured, we tag the row as
+	// "Other artifacts" so the user can tell at a glance which artifacts
+	// the model curated vs which were drafts/abandoned attempts; when
+	// nothing was featured, the row carries every image without that
+	// label (default for batch tasks or non-curating models).  Non-image
+	// attachments (audio/PDF/text) always pass through.
+	const rowExtrasInfo = $derived.by(() => {
+		const extras = message.extra ?? [];
+		if (extras.length === 0) {
+			return { items: [] as DatabaseMessageExtra[], modelCurated: false };
+		}
+		const inlineSrcs = resolveInlineImageSrcs(messageContent ?? '', extras);
+		let modelCurated = false;
+		const items = extras.filter((a: DatabaseMessageExtra) => {
+			if (a.type !== AttachmentType.IMAGE) return true;
+			const isFeatured =
+				inlineSrcs.has(a.base64Url) || (!!a.url && inlineSrcs.has(a.url));
+			if (isFeatured) {
+				modelCurated = true;
+				return false;
+			}
+			return true;
+		});
+		return { items, modelCurated };
+	});
+	const rowExtras = $derived(rowExtrasInfo.items);
+	const rowIsUncurated = $derived(rowExtrasInfo.modelCurated && rowExtras.length > 0);
 
 	let currentConfig = $derived(config());
 	let isRouter = $derived(isRouterMode());
@@ -248,6 +287,25 @@
 	{:else}
 		<div class="text-sm whitespace-pre-wrap">
 			{messageContent}
+		</div>
+	{/if}
+
+	{#if rowExtras.length > 0}
+		<div class="mt-3 mb-2" data-testid="assistant-artifact-row">
+			{#if rowIsUncurated}
+				<div
+					class="mb-1 text-xs text-muted-foreground"
+					data-testid="assistant-artifact-row-label"
+				>
+					Other artifacts ({rowExtras.length}) — not selected by model
+				</div>
+			{/if}
+			<ChatAttachmentsList
+				attachments={rowExtras}
+				readonly
+				limitToSingleRow
+				imageHeight="h-40"
+			/>
 		</div>
 	{/if}
 
