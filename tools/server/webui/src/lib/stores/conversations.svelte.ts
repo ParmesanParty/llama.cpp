@@ -30,7 +30,7 @@ import {
 	runLegacyMigration,
 	generateConversationTitle
 } from '$lib/utils';
-import type { McpServerOverride } from '$lib/types/database';
+import type { McpServerOverride, ConversationCompaction } from '$lib/types/database';
 import { MessageRole, HtmlInputType, FileExtensionText } from '$lib/enums';
 import {
 	ISO_DATE_TIME_SEPARATOR,
@@ -438,6 +438,28 @@ class ConversationsStore {
 	 */
 	async getConversationMessages(convId: string): Promise<DatabaseMessage[]> {
 		return await DatabaseService.getConversationMessages(convId);
+	}
+
+	/**
+	 * Sets compaction state on the active conversation.  Persists to Dexie
+	 * so the banner survives reloads, and updates the in-memory snapshot so
+	 * downstream consumers (ChatMessages dimming, banner rendering) react.
+	 */
+	async setCompaction(compaction: ConversationCompaction): Promise<void> {
+		if (!this.activeConversation) return;
+		this.activeConversation = { ...this.activeConversation, compaction };
+		await DatabaseService.updateConversation(this.activeConversation.id, { compaction });
+	}
+
+	/**
+	 * Clears compaction state on the active conversation.
+	 */
+	async clearCompaction(): Promise<void> {
+		if (!this.activeConversation) return;
+		this.activeConversation = { ...this.activeConversation, compaction: undefined };
+		await DatabaseService.updateConversation(this.activeConversation.id, {
+			compaction: undefined
+		});
 	}
 
 	/**

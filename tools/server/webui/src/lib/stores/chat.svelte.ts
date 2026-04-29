@@ -44,7 +44,13 @@ import type {
 	ChatStreamCallbacks,
 	ErrorDialogState
 } from '$lib/types/chat';
-import type { ApiProcessingState, DatabaseMessage, DatabaseMessageExtra } from '$lib/types';
+import type {
+	ApiCompactionMetadata,
+	ApiProcessingState,
+	ConversationCompaction,
+	DatabaseMessage,
+	DatabaseMessageExtra
+} from '$lib/types';
 import { ErrorDialogType, MessageRole, MessageType } from '$lib/enums';
 
 interface ConversationStateEntry {
@@ -622,6 +628,11 @@ class ChatStore {
 		let resolvedModel: string | null = null;
 		let modelPersisted = false;
 		const convId = assistantMessage.convId;
+		// Track messages actually sent to the proxy.  When a compaction event
+		// fires mid-stream, its compacted_up_to_index references positions in
+		// THIS array (which may have been transformed by buildCompactedMessages),
+		// not the full activeMessages history.
+		let sentMessages: DatabaseMessage[] | null = null;
 
 		const recordModel = (modelName: string | null | undefined, persistImmediately = true): void => {
 			if (!modelName) return;
@@ -830,6 +841,27 @@ class ChatStore {
 					contextInfo
 				});
 				if (onError) onError(error);
+			},
+			onCompaction: (metadata: ApiCompactionMetadata) => {
+				// metadata.compacted_up_to_index references positions in the
+				// messages array we sent (sentMessages), not the full
+				// activeMessages history.  If the boundary lands on the synthetic
+				// "compaction-summary" message, advance to the first real message
+				// after it so the banner anchors to a persisted message id.
+				const msgs = sentMessages ?? conversationsStore.activeMessages;
+				const boundaryMsg = msgs[metadata.compacted_up_to_index];
+				if (!boundaryMsg || !conversationsStore.activeConversation) return;
+				const resolvedId =
+					boundaryMsg.id === 'compaction-summary'
+						? msgs[metadata.compacted_up_to_index + 1]?.id
+						: boundaryMsg.id;
+				if (!resolvedId) return;
+				conversationsStore.setCompaction({
+					summary: metadata.summary,
+					compactedUpToMessageId: resolvedId,
+					compactedMessageCount: metadata.compacted_message_count,
+					timestamp: Date.now()
+				});
 			}
 		};
 
@@ -854,8 +886,17 @@ class ChatStore {
 			}
 		}
 
+		// Replace history with summary + recent if a prior compaction was
+		// recorded for this conversation.  sentMessages tracks what we
+		// actually transmit so onCompaction can resolve indices correctly.
+		const priorCompaction = conversationsStore.activeConversation?.compaction;
+		const messagesToSend = priorCompaction
+			? this.buildCompactedMessages(allMessages, priorCompaction)
+			: allMessages;
+		sentMessages = messagesToSend;
+
 		await ChatService.sendMessage(
-			allMessages,
+			messagesToSend,
 			{
 				...this.getApiOptions(),
 				...(effectiveModel ? { model: effectiveModel } : {}),
@@ -911,6 +952,38 @@ class ChatStore {
 			},
 			abortController.signal
 		);
+	}
+
+	/**
+	 * Replace pre-compaction history with a synthetic summary message.
+	 * The original messages stay in IndexedDB (so the user can still expand
+	 * the banner to see them) but aren't sent to the model — only the system
+	 * message, the synthetic summary, and any messages added after the
+	 * compaction boundary go on the wire.  Returns the input unchanged if the
+	 * boundary id can't be located (compaction is invalid for this branch).
+	 */
+	private buildCompactedMessages(
+		messages: DatabaseMessage[],
+		compaction: ConversationCompaction
+	): DatabaseMessage[] {
+		const boundaryIndex = messages.findIndex(
+			(m) => m.id === compaction.compactedUpToMessageId
+		);
+		if (boundaryIndex < 0) return messages;
+
+		const systemMsg = messages[0]?.role === MessageRole.SYSTEM ? [messages[0]] : [];
+		const summaryMsg: DatabaseMessage = {
+			id: 'compaction-summary',
+			convId: messages[0]?.convId ?? '',
+			type: MessageType.TEXT,
+			timestamp: compaction.timestamp,
+			role: MessageRole.USER,
+			content: `[Summary of earlier conversation:]\n\n${compaction.summary}`,
+			parent: null,
+			children: []
+		};
+		const recentMsgs = messages.slice(boundaryIndex + 1);
+		return [...systemMsg, summaryMsg, ...recentMsgs];
 	}
 
 	async stopGeneration(): Promise<void> {

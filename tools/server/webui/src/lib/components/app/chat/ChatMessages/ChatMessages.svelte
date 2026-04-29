@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { ChatMessage, ChatMessageUserPending } from '$lib/components/app';
+	import CompactionBanner from '$lib/components/app/chat/CompactionBanner.svelte';
 	import { setChatActionsContext } from '$lib/contexts';
 	import { MessageRole } from '$lib/enums';
 	import { chatStore } from '$lib/stores/chat.svelte';
@@ -32,8 +33,26 @@
 	let { messages = [], onUserAction }: Props = $props();
 
 	let allConversationMessages = $state<DatabaseMessage[]>([]);
+	let summaryExpanded = $state(false);
+	let historyExpanded = $state(false);
+	const currentConfig = $derived(config());
 
-	const currentConfig = config();
+	// Reset banner expansion state when conversation changes — otherwise a
+	// previous chat's history toggle bleeds into the next one.
+	$effect(() => {
+		activeConversation();
+		summaryExpanded = false;
+		historyExpanded = false;
+	});
+
+	// Compaction state from active conversation, plus the boundary index in
+	// `messages` so the renderer can dim everything from index 0 through the
+	// boundary message inclusive.
+	let compaction = $derived(activeConversation()?.compaction);
+	let compactionBoundaryIndex = $derived.by(() => {
+		if (!compaction || !messages.length) return -1;
+		return messages.findIndex((m) => m.id === compaction!.compactedUpToMessageId);
+	});
 
 	setChatActionsContext({
 		copy: async (message: DatabaseMessage) => {
@@ -141,6 +160,8 @@
 			message: DatabaseMessage;
 			toolMessages: DatabaseMessage[];
 			isLastAssistantMessage: boolean;
+			isInCompactedRegion: boolean;
+			isCompactionBoundaryNext: boolean;
 			siblingInfo: ChatMessageSiblingInfo;
 		}> = [];
 
@@ -182,10 +203,26 @@
 
 			const siblingInfo = getMessageSiblings(allConversationMessages, msg.id);
 
+			// Compaction zone membership: messages whose index in the original
+			// `messages` array sits at or before the boundary message are dimmed
+			// (and hidden unless historyExpanded). The message immediately AFTER
+			// the boundary triggers banner rendering above it.
+			const origIndex = messages.indexOf(msg);
+			const isSystemMessage = msg.type === MessageRole.SYSTEM;
+			const isInCompactedRegion =
+				compactionBoundaryIndex >= 0 &&
+				!isSystemMessage &&
+				origIndex >= 0 &&
+				origIndex <= compactionBoundaryIndex;
+			const isCompactionBoundaryNext =
+				compactionBoundaryIndex >= 0 && origIndex === compactionBoundaryIndex + 1;
+
 			result.push({
 				message: msg,
 				toolMessages,
 				isLastAssistantMessage: false,
+				isInCompactedRegion,
+				isCompactionBoundaryNext,
 				siblingInfo: siblingInfo || {
 					message: msg,
 					siblingIds: [msg.id],
@@ -207,14 +244,42 @@
 	});
 </script>
 
-{#each displayMessages as { message, toolMessages, isLastAssistantMessage, siblingInfo } (message.id)}
-	<ChatMessage
-		class="mx-auto mt-12 w-full max-w-[48rem]"
-		{message}
-		{toolMessages}
-		{isLastAssistantMessage}
-		{siblingInfo}
-	/>
+{#each displayMessages as { message, toolMessages, isLastAssistantMessage, isInCompactedRegion, isCompactionBoundaryNext, siblingInfo } (message.id)}
+	{#if isCompactionBoundaryNext && compaction}
+		<CompactionBanner
+			summary={compaction.summary}
+			messageCount={compaction.compactedMessageCount}
+			{summaryExpanded}
+			{historyExpanded}
+			onToggleSummary={() => {
+				summaryExpanded = !summaryExpanded;
+				if (!summaryExpanded) historyExpanded = false;
+			}}
+			onToggleHistory={() => (historyExpanded = !historyExpanded)}
+		/>
+	{/if}
+
+	{#if isInCompactedRegion}
+		{#if historyExpanded}
+			<div class="border-l-2 border-muted-foreground/20 opacity-50">
+				<ChatMessage
+					class="mx-auto mt-12 w-full max-w-[48rem]"
+					{message}
+					{toolMessages}
+					{isLastAssistantMessage}
+					{siblingInfo}
+				/>
+			</div>
+		{/if}
+	{:else}
+		<ChatMessage
+			class="mx-auto mt-12 w-full max-w-[48rem]"
+			{message}
+			{toolMessages}
+			{isLastAssistantMessage}
+			{siblingInfo}
+		/>
+	{/if}
 {/each}
 
 {#if activeConversation() && agenticPendingSteeringMessageContent(activeConversation()!.id)}

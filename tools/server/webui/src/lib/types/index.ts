@@ -60,6 +60,7 @@ export type {
 
 // Database types
 export type {
+	ConversationCompaction,
 	McpServerOverride,
 	DatabaseConversation,
 	DatabaseMessageExtraAudioFile,

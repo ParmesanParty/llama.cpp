@@ -6,6 +6,19 @@ export interface McpServerOverride {
 	enabled: boolean;
 }
 
+/**
+ * Snapshot of an in-conversation compaction event.  When the orchestrator
+ * decides the rolling history would no longer fit alongside a new turn, it
+ * summarizes everything up to a boundary message and the UI renders the
+ * summary + a banner so the user can still see what was compacted.
+ */
+export interface ConversationCompaction {
+	summary: string;
+	compactedUpToMessageId: string;
+	compactedMessageCount: number;
+	timestamp: number;
+}
+
 export interface DatabaseConversation {
 	currNode: string | null;
 	id: string;
@@ -15,6 +28,7 @@ export interface DatabaseConversation {
 	forkedFromConversationId?: string;
 	enableThinking?: boolean;
 	preserveThinking?: boolean;
+	compaction?: ConversationCompaction;
 }
 
 export interface DatabaseMessageExtraAudioFile {
