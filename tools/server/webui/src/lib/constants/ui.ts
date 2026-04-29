@@ -1,4 +1,4 @@
-import { Settings, Search, SquarePen } from '@lucide/svelte';
+import { PencilRuler, Settings, Search, SquarePen } from '@lucide/svelte';
 import McpLogo from '$lib/components/app/mcp/McpLogo.svelte';
 import type { Component } from 'svelte';
 
@@ -12,6 +12,7 @@ export const ICON_STRIP_TRANSITION_DELAY_MULTIPLIER = 50;
 export interface DesktopIconStripItem {
 	icon: Component;
 	tooltip: string;
+	id?: string;
 	route?: string;
 	activeRouteId?: string;
 	activeRoutePrefix?: string;
@@ -26,6 +27,13 @@ export const SIDEBAR_ACTIONS_ITEMS: DesktopIconStripItem[] = [
 		tooltip: 'MCP Servers',
 		route: '#/settings/mcp',
 		activeRouteId: '/settings/mcp'
+	},
+	{
+		id: 'tools',
+		icon: PencilRuler,
+		tooltip: 'Tools',
+		route: '#/settings/chat/tools',
+		activeRouteId: '/settings/chat/[section]'
 	},
 	{
 		icon: Settings,

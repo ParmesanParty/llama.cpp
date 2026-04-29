@@ -5,6 +5,15 @@
 	import { SearchInput } from '$lib/components/app';
 	import { page } from '$app/state';
 	import { SIDEBAR_ACTIONS_ITEMS } from '$lib/constants/ui';
+	import { toolHealthStore } from '$lib/stores/toolHealth.svelte';
+
+	const toolHealthDot = $derived.by<string | null>(() => {
+		const c = toolHealthStore.badgeColor;
+		if (c === 'green') return null;
+		if (c === 'amber') return 'bg-amber-500';
+		if (c === 'red') return 'bg-red-500';
+		return 'bg-muted-foreground/40';
+	});
 
 	interface Props {
 		handleMobileSidebarItemClick: () => void;
@@ -84,6 +93,13 @@
 						{@render itemIcon(item.icon)}
 
 						{item.tooltip}
+
+						{#if item.id === 'tools' && toolHealthDot}
+							<span
+								class="ml-1 inline-block h-2 w-2 rounded-full {toolHealthDot}"
+								aria-hidden="true"
+							></span>
+						{/if}
 					</div>
 
 					{#if item.keys}

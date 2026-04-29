@@ -8,6 +8,7 @@
 		SIDEBAR_ACTIONS_ITEMS
 	} from '$lib/constants';
 	import { TooltipSide } from '$lib/enums';
+	import { toolHealthStore } from '$lib/stores/toolHealth.svelte';
 	import { fade } from 'svelte/transition';
 	import { circIn } from 'svelte/easing';
 	import { onMount } from 'svelte';
@@ -24,6 +25,17 @@
 
 	let initialized = $state(false);
 	let showIcons = $derived(!sidebarOpen);
+
+	// Aggregate health-badge color from toolHealthStore. Renders as a small dot
+	// overlay on the Tools icon when not 'green' — i.e., any tool degraded or
+	// circuit-broken, or the SSE connection has dropped.
+	const toolHealthDot = $derived.by<string | null>(() => {
+		const c = toolHealthStore.badgeColor;
+		if (c === 'green') return null;
+		if (c === 'amber') return 'bg-amber-500';
+		if (c === 'red') return 'bg-red-500';
+		return 'bg-muted-foreground/40';
+	});
 
 	showIcons = false;
 
@@ -58,6 +70,7 @@
 					: false}
 			{#if showIcons}
 				<div
+					class="relative"
 					in:fade={{
 						duration: ICON_STRIP_TRANSITION_DURATION,
 						delay: !initialized
@@ -77,6 +90,12 @@
 							: ''}"
 						{onclick}
 					/>
+					{#if item.id === 'tools' && toolHealthDot}
+						<span
+							class="pointer-events-none absolute top-1.5 right-1.5 h-2 w-2 rounded-full ring-2 ring-background {toolHealthDot}"
+							aria-hidden="true"
+						></span>
+					{/if}
 				</div>
 			{/if}
 		{/each}
