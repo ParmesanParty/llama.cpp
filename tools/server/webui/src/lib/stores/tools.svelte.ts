@@ -258,6 +258,18 @@ class ToolsStore {
 		return this._disabledTools;
 	}
 
+	/**
+	 * Names of disabled builtin (server-side) tools, intersected with the
+	 * builtin catalog so MCP tool names disabled by the same user toggle don't
+	 * leak through. Consumed by chat-request-builder (X-Disabled-Builtin-Tools
+	 * header) on the non-merged-orch path and by the merged-orchestration
+	 * register/PATCH payload (server_tool_enablement) on the merged-orch path.
+	 */
+	get disabledBuiltinTools(): string[] {
+		const builtinNames = new Set(this._builtinTools.map((t) => t.function.name));
+		return [...this._disabledTools].filter((n) => builtinNames.has(n));
+	}
+
 	isToolEnabled(toolName: string): boolean {
 		return !this._disabledTools.has(toolName);
 	}
@@ -277,6 +289,7 @@ class ToolsStore {
 		} else {
 			this._disabledTools.add(toolName);
 		}
+		this.persistDisabledTools();
 	}
 
 	/**

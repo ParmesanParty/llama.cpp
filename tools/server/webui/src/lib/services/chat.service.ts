@@ -3,6 +3,7 @@ import { formatAttachmentText } from '$lib/utils/formatters';
 import { isAbortError } from '$lib/utils/abort';
 import { mergedOrchestrationStore } from '$lib/stores/merged-orchestration.svelte';
 import { mcpStore } from '$lib/stores/mcp.svelte';
+import { toolsStore } from '$lib/stores/tools.svelte';
 import { base } from '$app/paths';
 import { buildChatRequest } from './chat-request-builder';
 import { shouldRetryAfter410 } from './chat-410-recovery';
@@ -277,13 +278,19 @@ export class ChatService {
 			// silently to a tools-bearing no-session request.
 			await mergedOrchestrationStore.waitUntilReady();
 
+			// Snapshot the disabled-builtins list at request time. Only used on
+			// the non-merged-orch path; merged-orch carries the same intent via
+			// the session's server_tool_enablement map.
+			const disabledBuiltinTools = toolsStore.disabledBuiltinTools;
+
 			let { url, init } = buildChatRequest({
 				requestBody: requestBody as unknown as Record<string, unknown>,
 				stream: stream ?? false,
 				codeExecSessionId,
 				signal,
 				sessionId: mergedOrchestrationStore.sessionId,
-				sessionToken: mergedOrchestrationStore.sessionToken
+				sessionToken: mergedOrchestrationStore.sessionToken,
+				disabledBuiltinTools
 			});
 			let response = await fetch(url, init);
 
@@ -302,7 +309,8 @@ export class ChatService {
 							codeExecSessionId,
 							signal,
 							sessionId: mergedOrchestrationStore.sessionId,
-							sessionToken: mergedOrchestrationStore.sessionToken
+							sessionToken: mergedOrchestrationStore.sessionToken,
+							disabledBuiltinTools
 						}));
 						response = await fetch(url, init);
 					} else {

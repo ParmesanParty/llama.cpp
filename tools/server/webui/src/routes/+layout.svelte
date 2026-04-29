@@ -24,6 +24,7 @@
 	import { modelsStore } from '$lib/stores/models.svelte';
 	import { mcpStore } from '$lib/stores/mcp.svelte';
 	import { mergedOrchestrationStore } from '$lib/stores/merged-orchestration.svelte';
+	import { toolsStore } from '$lib/stores/tools.svelte';
 	import { TOOLTIP_DELAY_DURATION } from '$lib/constants';
 	import { IsMobile } from '$lib/hooks/is-mobile.svelte';
 	import { useKeyboardShortcuts } from '$lib/hooks/use-keyboard-shortcuts.svelte';
@@ -283,6 +284,33 @@
 					console.warn('[layout] merged orchestration reconcile failed', e);
 				}
 			})();
+		});
+	});
+
+	// Merged orchestration: PATCH session.server_tool_enablement when the user
+	// toggles a builtin tool. Initial state is sent at register time, so this
+	// effect skips the first $effect tick and only fires on subsequent changes.
+	let builtinDisabledFirstRun = true;
+	let lastBuiltinDisabledSignature = '';
+	$effect(() => {
+		if (!browser) return;
+		const sig = toolsStore.disabledBuiltinTools.slice().sort().join(',');
+		if (builtinDisabledFirstRun) {
+			builtinDisabledFirstRun = false;
+			lastBuiltinDisabledSignature = sig;
+			return;
+		}
+		if (sig === lastBuiltinDisabledSignature) return;
+		lastBuiltinDisabledSignature = sig;
+
+		if (!mergedOrchestrationStore.isEnabled) return;
+		if (!mergedOrchestrationStore.sessionId) return;
+
+		untrack(() => {
+			void mergedOrchestrationStore.applyServerToolEnablement(
+				toolsStore.builtinTools.map((t) => t.function.name),
+				toolsStore.disabledBuiltinTools
+			);
 		});
 	});
 

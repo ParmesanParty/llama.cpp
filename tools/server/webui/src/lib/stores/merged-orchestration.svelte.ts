@@ -1,6 +1,7 @@
 import { base } from '$app/paths';
 
 import { mcpStore } from './mcp.svelte';
+import { toolsStore } from './tools.svelte';
 
 interface SessionInfo {
 	sessionId: string;
@@ -95,6 +96,59 @@ export class MergedOrchestrationStore {
 	}
 
 	/**
+	 * PATCH session.server_tool_enablement when the user toggles a builtin
+	 * tool in ChatSettingsToolsTab. The proxy stores the per-session map and
+	 * filters auto-injection inside `build_merged_catalog` on every iteration
+	 * — no per-request header needed on the merged-orch path.
+	 *
+	 * The proxy's PATCH semantics are "set these keys" (sessions.py:2344
+	 * iterates and assigns `s.server_tool_enablement[k] = v`), NOT replace
+	 * the full map — so to flip a tool from disabled back to enabled we MUST
+	 * include that tool with `true` in the body. Caller passes the full
+	 * builtin-tool name list so we can emit the complete enabled/disabled
+	 * state rather than only the disabled subset.
+	 *
+	 * Best-effort: a failed PATCH leaves the proxy's view stale until the
+	 * next reconcile; toggling is interactive so the user can re-toggle if
+	 * a request shows the old behavior.
+	 */
+	async applyServerToolEnablement(
+		allBuiltinNames: string[],
+		disabledBuiltinTools: string[]
+	): Promise<void> {
+		if (!this._session) return;
+		const { sessionId, sessionToken } = this._session;
+		const disabled = new Set(disabledBuiltinTools);
+		const setMap: Record<string, boolean> = {};
+		for (const name of allBuiltinNames) {
+			setMap[name] = !disabled.has(name);
+		}
+		try {
+			const resp = await fetch(`${base}/api/sessions/${sessionId}`, {
+				method: 'PATCH',
+				headers: { 'Content-Type': 'application/json', 'X-Session-Token': sessionToken },
+				body: JSON.stringify({ set_server_tool_enablement: setMap })
+			});
+			if (!resp.ok) {
+				console.warn('[MergedOrchestration] PATCH server_tool_enablement failed', resp.status);
+			}
+		} catch (e) {
+			console.warn('[MergedOrchestration] PATCH server_tool_enablement threw', e);
+		}
+	}
+
+	/** Build the initial server_tool_enablement map sent on session register.
+	 * Disabled builtins map to `false`; enabled tools are omitted (the proxy
+	 * defaults missing keys to enabled). Sufficient because session creation
+	 * starts from an empty map — PATCH later carries the full state when
+	 * re-enabling matters. */
+	private _buildServerEnablement(): Record<string, boolean> {
+		const map: Record<string, boolean> = {};
+		for (const name of toolsStore.disabledBuiltinTools) map[name] = false;
+		return map;
+	}
+
+	/**
 	 * Resolves when no session registration is in flight. Callers (e.g.
 	 * chat.service.sendMessage) await this before reading sessionId so they
 	 * don't snapshot a transient null during cold-start ($effect-fire to
@@ -116,7 +170,7 @@ export class MergedOrchestrationStore {
 
 		const promise = (async (): Promise<SessionInfo | null> => {
 			const clientTools = this._buildClientToolsList();
-			const serverEnablement: Record<string, boolean> = {};
+			const serverEnablement = this._buildServerEnablement();
 
 			try {
 				const resp = await fetch(`${base}${this._capability!.endpoints.sessions}`, {

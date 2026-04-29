@@ -11,6 +11,12 @@ export interface BuildChatRequestParams {
 	sessionId: string | null;
 	/** Merged-orchestration session token (null if not registered). */
 	sessionToken: string | null;
+	/** Names of builtin tools the user has disabled in ChatSettingsToolsTab.
+	 * Riding the request as the X-Disabled-Builtin-Tools header tells the proxy's
+	 * orchestrator to skip those tools when auto-injecting the catalog on the
+	 * non-merged-orch path. Ignored on the merged-orch path (the session's
+	 * server_tool_enablement map carries the same intent). */
+	disabledBuiltinTools?: string[];
 }
 
 /**
@@ -29,7 +35,15 @@ export function buildChatRequest(params: BuildChatRequestParams): {
 	url: string;
 	init: RequestInit;
 } {
-	const { requestBody, stream, codeExecSessionId, signal, sessionId, sessionToken } = params;
+	const {
+		requestBody,
+		stream,
+		codeExecSessionId,
+		signal,
+		sessionId,
+		sessionToken,
+		disabledBuiltinTools
+	} = params;
 
 	const headers: Record<string, string> = stream ? getStreamHeaders() : getJsonHeaders();
 	if (codeExecSessionId) {
@@ -44,8 +58,16 @@ export function buildChatRequest(params: BuildChatRequestParams): {
 		// caller-supplied `tools` to avoid the proxy's incoherent_request 400 —
 		// and to actually make merged-orchestration take effect.
 		delete body.tools;
+		// Per-tool toggle for merged-orch sessions rides server_tool_enablement
+		// on the session record, not a per-request header. Don't emit it here.
 	} else {
 		delete body.session_id;
+		// Non-merged-orch path: thread the user's disabled builtins through to
+		// the proxy's auto-injection filter. Empty list is ignored — emit only
+		// when at least one tool is actually disabled.
+		if (disabledBuiltinTools && disabledBuiltinTools.length > 0) {
+			headers['X-Disabled-Builtin-Tools'] = disabledBuiltinTools.join(',');
+		}
 	}
 
 	return {

@@ -130,4 +130,47 @@ describe('buildChatRequest', () => {
 		});
 		expect(requestBody.tools).toEqual(tools);
 	});
+
+	it('no session, with disabled builtins: emits X-Disabled-Builtin-Tools header', () => {
+		const { init } = buildChatRequest({
+			requestBody: { ...baseRequestBody },
+			stream: true,
+			codeExecSessionId: undefined,
+			signal: undefined,
+			sessionId: null,
+			sessionToken: null,
+			disabledBuiltinTools: ['code_exec', 'image_gen']
+		});
+		const headers = init.headers as Record<string, string>;
+		expect(headers['X-Disabled-Builtin-Tools']).toBe('code_exec,image_gen');
+	});
+
+	it('no session, empty disabled list: header is omitted', () => {
+		const { init } = buildChatRequest({
+			requestBody: { ...baseRequestBody },
+			stream: true,
+			codeExecSessionId: undefined,
+			signal: undefined,
+			sessionId: null,
+			sessionToken: null,
+			disabledBuiltinTools: []
+		});
+		const headers = init.headers as Record<string, string>;
+		expect(headers['X-Disabled-Builtin-Tools']).toBeUndefined();
+	});
+
+	it('session active: X-Disabled-Builtin-Tools is NOT emitted (server_tool_enablement is the canonical channel)', () => {
+		const { init } = buildChatRequest({
+			requestBody: { ...baseRequestBody },
+			stream: true,
+			codeExecSessionId: undefined,
+			signal: undefined,
+			sessionId: 'sid',
+			sessionToken: 'tok',
+			disabledBuiltinTools: ['code_exec']
+		});
+		const headers = init.headers as Record<string, string>;
+		expect(headers['X-Disabled-Builtin-Tools']).toBeUndefined();
+		expect(headers['X-Session-Token']).toBe('tok');
+	});
 });
