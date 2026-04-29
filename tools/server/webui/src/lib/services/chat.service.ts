@@ -591,8 +591,14 @@ export class ChatService {
 		interface DispatchEntry {
 			state: DispatchState;
 			result?: ToolCallbackBody;
+			/** Cancel/abort reason when no ToolCallbackBody is produced. */
+			error?: string;
 		}
 		const dispatchStateMap = new Map<string, DispatchEntry>();
+		// Per-correlation AbortController so tool-execute-cancel can abort an
+		// in-flight MCPService call. Cleared in finally after the dispatch
+		// resolves, so the map mirrors only currently-running dispatches.
+		const dispatchAbortControllerMap = new Map<string, AbortController>();
 
 		const finalizeOpenToolCallBatch = () => {
 			if (!hasOpenToolCallBatch) {
@@ -678,7 +684,9 @@ export class ChatService {
 						);
 						break;
 					case 'tool-execute-cancel':
-						handleToolExecuteCancelEvent(payload as { correlation_id: string });
+						handleToolExecuteCancelEvent(
+							payload as { correlation_id: string; reason: string }
+						);
 						break;
 					default:
 						if (import.meta.env.DEV) {
@@ -753,12 +761,22 @@ export class ChatService {
 				return;
 			}
 
+			// AbortController so tool-execute-cancel can abort the MCP call.
+			// Pre-poisoning by the cancel handler may have set state='failed'
+			// already; we still create the controller so the in-flight check
+			// has somewhere to register.
+			const ctrl = new AbortController();
+			dispatchAbortControllerMap.set(corrId, ctrl);
 			dispatchStateMap.set(corrId, { state: 'dispatching' });
 
 			const startedAt = performance.now();
 			let body: ToolCallbackBody;
 			try {
-				const result = await mcpStore.executeToolByName(data.tool_name_local, data.args);
+				const result = await mcpStore.executeToolByName(
+					data.tool_name_local,
+					data.args,
+					ctrl.signal
+				);
 				body = {
 					ok: !result.isError,
 					content: result.content,
@@ -769,6 +787,22 @@ export class ChatService {
 				};
 				dispatchStateMap.set(corrId, { state: 'completed', result: body });
 			} catch (e) {
+				if (ctrl.signal.aborted) {
+					if (!isAbortError(e)) {
+						console.warn('[ChatService] non-abort exception during tool cancel', e);
+					}
+					// Server already resolved this call via the cancel SSE event;
+					// no callback POST. Preserve the cancel handler's reason if
+					// it pre-poisoned the entry (e.g. 'timeout'); otherwise
+					// fall back to 'aborted'.
+					const existingEntry = dispatchStateMap.get(corrId);
+					const reason =
+						existingEntry?.state === 'failed' && existingEntry.error
+							? existingEntry.error
+							: 'aborted';
+					dispatchStateMap.set(corrId, { state: 'failed', error: reason });
+					return;
+				}
 				console.warn('[ChatService] tool-execute dispatch failed', e);
 				body = {
 					ok: false,
@@ -779,14 +813,25 @@ export class ChatService {
 					client_latency_ms: Math.round(performance.now() - startedAt)
 				};
 				dispatchStateMap.set(corrId, { state: 'failed', result: body });
+			} finally {
+				dispatchAbortControllerMap.delete(corrId);
 			}
 			await postToolCallback(sid, token, corrId, body, 'POST');
 		};
 
-		const handleToolExecuteCancelEvent = (data: { correlation_id: string }): void => {
-			// Phase 1: log only. R14.5 wires AbortSignal propagation per
-			// correlation_id so an in-flight MCP call can be cancelled here.
-			console.info('[ChatService] tool-execute-cancel', data.correlation_id);
+		const handleToolExecuteCancelEvent = (data: {
+			correlation_id: string;
+			reason: string;
+		}): void => {
+			const ctrl = dispatchAbortControllerMap.get(data.correlation_id);
+			if (ctrl) ctrl.abort();
+			// Pre-poison the state so a late tool-execute (cancel-before-execute,
+			// race) short-circuits dedup without dispatching. The dispatch
+			// catch will read the reason here when preserving cancel context.
+			dispatchStateMap.set(data.correlation_id, {
+				state: 'failed',
+				error: data.reason
+			});
 		};
 
 		// Inner read-loop: drains a single SSE reader into the closure-scope
