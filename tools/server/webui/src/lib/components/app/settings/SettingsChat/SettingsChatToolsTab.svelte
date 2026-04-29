@@ -2,10 +2,11 @@
 	import { ChevronDown, ChevronRight } from '@lucide/svelte';
 	import { Checkbox } from '$lib/components/ui/checkbox';
 	import * as Collapsible from '$lib/components/ui/collapsible';
-	import { TruncatedText } from '$lib/components/app';
+	import { ToolHealthBadge, TruncatedText } from '$lib/components/app';
 	import { toolsStore } from '$lib/stores/tools.svelte';
 	import { permissionsStore } from '$lib/stores/permissions.svelte';
 	import { mcpStore } from '$lib/stores/mcp.svelte';
+	import { toolHealthStore } from '$lib/stores/toolHealth.svelte';
 	import { ToolSource } from '$lib/enums';
 	import { SvelteSet } from 'svelte/reactivity';
 
@@ -87,8 +88,19 @@
 							{@const isAlwaysAllowed = permissionKey
 								? permissionsStore.hasTool(permissionKey)
 								: false}
+							{@const isBuiltin = group.source === ToolSource.BUILTIN}
+
+							{@const healthEntry = toolHealthStore.tools.get(toolName)}
 
 							<div class="flex items-center gap-2 rounded px-2 py-1.5 text-sm hover:bg-muted/50">
+								{#if healthEntry}
+									<ToolHealthBadge
+										breaker_state={healthEntry.breaker_state}
+										preflight_ok={healthEntry.preflight_ok}
+										recent_failures={healthEntry.recent_failures}
+									/>
+								{/if}
+
 								<TruncatedText text={toolName} class="min-w-0 flex-1 truncate" showTooltip={true} />
 
 								<div class="flex w-16 shrink-0 justify-center">
@@ -99,18 +111,28 @@
 									/>
 								</div>
 
-								<div class="flex w-20 shrink-0 justify-center">
-									<Checkbox
-										checked={isAlwaysAllowed}
-										onCheckedChange={() => {
-											if (isAlwaysAllowed) {
-												permissionsStore.revokeTool(permissionKey!);
-											} else {
-												permissionsStore.allowTool(permissionKey!);
-											}
-										}}
-										class="h-4 w-4"
-									/>
+								<div class="flex w-20 shrink-0 items-center justify-center">
+									{#if isBuiltin}
+										<!--
+											Per-call permission gating is an MCP-client concept; built-in
+											tools execute server-side and never round-trip through the
+											permissionsStore. Render an em-dash placeholder so the column
+											stays visually aligned without offering an inert checkbox.
+										-->
+										<span class="text-muted-foreground" title="Built-in tools execute server-side; per-call permission gating doesn't apply.">—</span>
+									{:else}
+										<Checkbox
+											checked={isAlwaysAllowed}
+											onCheckedChange={() => {
+												if (isAlwaysAllowed) {
+													permissionsStore.revokeTool(permissionKey!);
+												} else {
+													permissionsStore.allowTool(permissionKey!);
+												}
+											}}
+											class="h-4 w-4"
+										/>
+									{/if}
 								</div>
 							</div>
 						{/each}
