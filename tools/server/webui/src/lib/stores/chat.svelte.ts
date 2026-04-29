@@ -15,7 +15,7 @@ import { SvelteMap } from 'svelte/reactivity';
 import { DatabaseService } from '$lib/services/database.service';
 import { ChatService } from '$lib/services/chat.service';
 import { conversationsStore } from '$lib/stores/conversations.svelte';
-import { config } from '$lib/stores/settings.svelte';
+import { config, settingsStore } from '$lib/stores/settings.svelte';
 import { agenticStore } from '$lib/stores/agentic.svelte';
 import { mcpStore } from '$lib/stores/mcp.svelte';
 import { contextSize, isRouterMode } from '$lib/stores/server.svelte';
@@ -1710,6 +1710,14 @@ class ChatStore {
 		apiOptions.backend_sampling = currentConfig.backend_sampling;
 
 		if (currentConfig.custom) apiOptions.custom = currentConfig.custom;
+
+		// When thinking is enabled, merge thinking-mode sampling overrides.
+		// Applied last so they override base params for the thinking context.
+		if (apiOptions.enableThinking && settingsStore.hasThinkingOverrides) {
+			for (const [param, value] of Object.entries(settingsStore.thinkingOverrides)) {
+				apiOptions[param] = value;
+			}
+		}
 
 		return apiOptions;
 	}

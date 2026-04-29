@@ -196,6 +196,7 @@ export interface ApiLlamaCppServerProps {
 	eos_token: string;
 	build_info: string;
 	webui_settings?: Record<string, string | number | boolean>;
+	thinking_overrides?: Record<string, number>;
 }
 
 export interface ApiChatCompletionRequest {

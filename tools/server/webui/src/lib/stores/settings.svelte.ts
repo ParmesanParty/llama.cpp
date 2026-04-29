@@ -61,6 +61,12 @@ class SettingsStore {
 	isInitialized = $state(false);
 	userOverrides = $state<Set<string>>(new Set());
 
+	// Thinking-mode override state
+	private _thinkingOverrides = $state<Record<string, number>>({});
+	private _thinkingUserOverrides = $state<Set<string>>(new Set());
+	private static readonly THINKING_OVERRIDES_KEY = 'LlamacppWebui.thinkingOverrides';
+	private static readonly THINKING_USER_OVERRIDES_KEY = 'LlamacppWebui.thinkingUserOverrides';
+
 	/**
 	 *
 	 *
@@ -82,6 +88,16 @@ class SettingsStore {
 	constructor() {
 		if (browser) {
 			this.initialize();
+
+			// Load thinking overrides from localStorage
+			try {
+				const saved = localStorage.getItem(SettingsStore.THINKING_OVERRIDES_KEY);
+				if (saved) this._thinkingOverrides = JSON.parse(saved);
+				const savedUserOv = localStorage.getItem(SettingsStore.THINKING_USER_OVERRIDES_KEY);
+				if (savedUserOv) this._thinkingUserOverrides = new Set(JSON.parse(savedUserOv));
+			} catch {
+				// Ignore parse errors — use defaults
+			}
 		}
 	}
 
@@ -314,6 +330,92 @@ class SettingsStore {
 	/**
 	 *
 	 *
+	 * Thinking Overrides
+	 *
+	 *
+	 */
+
+	/** Server-provided thinking overrides (from /props). */
+	get thinkingOverrides(): Record<string, number> {
+		return this._thinkingOverrides;
+	}
+
+	/** Whether any thinking overrides are configured. */
+	get hasThinkingOverrides(): boolean {
+		return Object.keys(this._thinkingOverrides).length > 0;
+	}
+
+	/** Get the effective thinking value for a param (user override or server default). */
+	getThinkingValue(param: string): number | undefined {
+		return this._thinkingOverrides[param];
+	}
+
+	/** Whether the user has customized a specific thinking param. */
+	isThinkingUserOverride(param: string): boolean {
+		return this._thinkingUserOverrides.has(param);
+	}
+
+	/** Set a user-customized thinking override value. */
+	setThinkingOverride(param: string, value: number): void {
+		this._thinkingOverrides[param] = value;
+		this._thinkingUserOverrides.add(param);
+		this.saveThinkingOverrides();
+	}
+
+	/** Reset a thinking override to the server default. */
+	resetThinkingOverride(param: string, serverValue: number): void {
+		this._thinkingOverrides[param] = serverValue;
+		this._thinkingUserOverrides.delete(param);
+		this.saveThinkingOverrides();
+	}
+
+	/** Sync thinking overrides from /props server response.
+	 *  Uses snapshots of reactive state to avoid triggering $effect loops
+	 *  when called from within a reactive context (e.g. +layout.svelte).
+	 */
+	syncThinkingOverrides(serverOverrides: Record<string, number>): void {
+		// Snapshot current state to avoid reading $state during merge
+		const currentOverrides = { ...this._thinkingOverrides };
+		const currentUserOv = new Set(this._thinkingUserOverrides);
+
+		const merged: Record<string, number> = {};
+		for (const [key, value] of Object.entries(serverOverrides)) {
+			if (currentUserOv.has(key) && key in currentOverrides) {
+				merged[key] = currentOverrides[key];
+			} else {
+				merged[key] = value;
+			}
+		}
+
+		// Prune user overrides for keys no longer in server set
+		const prunedUserOv = new Set(currentUserOv);
+		for (const key of currentUserOv) {
+			if (!(key in serverOverrides)) {
+				prunedUserOv.delete(key);
+			}
+		}
+
+		// Single write to each $state field (no read-after-write)
+		this._thinkingOverrides = merged;
+		this._thinkingUserOverrides = prunedUserOv;
+		this.saveThinkingOverrides();
+	}
+
+	private saveThinkingOverrides(): void {
+		if (!browser) return;
+		localStorage.setItem(
+			SettingsStore.THINKING_OVERRIDES_KEY,
+			JSON.stringify(this._thinkingOverrides)
+		);
+		localStorage.setItem(
+			SettingsStore.THINKING_USER_OVERRIDES_KEY,
+			JSON.stringify([...this._thinkingUserOverrides])
+		);
+	}
+
+	/**
+	 *
+	 *
 	 * Server Sync
 	 *
 	 *
@@ -360,7 +462,12 @@ class SettingsStore {
 		}
 
 		this.saveConfig();
-		console.log('User overrides after sync:', Array.from(this.userOverrides));
+		console.log('Settings initialized with props defaults:', propsDefaults);
+		console.log('Current user overrides after sync:', Array.from(this.userOverrides));
+
+		// Sync thinking overrides
+		const thinkingOv = ParameterSyncService.extractThinkingOverrides(serverStore.props);
+		this.syncThinkingOverrides(thinkingOv);
 	}
 
 	/**

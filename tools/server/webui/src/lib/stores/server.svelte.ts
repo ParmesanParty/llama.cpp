@@ -54,6 +54,10 @@ class ServerStore {
 		return this.props?.webui_settings;
 	}
 
+	get thinkingOverrides(): Record<string, number> | null {
+		return this.props?.thinking_overrides ?? null;
+	}
+
 	get isRouterMode(): boolean {
 		return this.role === ServerRole.ROUTER;
 	}
@@ -156,3 +160,4 @@ export const defaultParams = () => serverStore.defaultParams;
 export const contextSize = () => serverStore.contextSize;
 export const isRouterMode = () => serverStore.isRouterMode;
 export const isModelMode = () => serverStore.isModelMode;
+export const thinkingOverrides = () => serverStore.thinkingOverrides;
