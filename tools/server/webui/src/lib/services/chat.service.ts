@@ -2,6 +2,8 @@ import { getJsonHeaders } from '$lib/utils/api-headers';
 import { formatAttachmentText } from '$lib/utils/formatters';
 import { isAbortError } from '$lib/utils/abort';
 import { mergedOrchestrationStore } from '$lib/stores/merged-orchestration.svelte';
+import { mcpStore } from '$lib/stores/mcp.svelte';
+import { base } from '$app/paths';
 import { buildChatRequest } from './chat-request-builder';
 import { shouldRetryAfter410 } from './chat-410-recovery';
 import {
@@ -639,6 +641,20 @@ export class ChatService {
 					case 'tool_arg_stream':
 						onToolArgStream?.(payload as ApiToolArgStreamEvent);
 						break;
+					case 'tool-execute':
+						void handleToolExecuteEvent(
+							payload as {
+								correlation_id: string;
+								name: string;
+								server_alias: string;
+								tool_name_local: string;
+								args: Record<string, unknown>;
+							}
+						);
+						break;
+					case 'tool-execute-cancel':
+						handleToolExecuteCancelEvent(payload as { correlation_id: string });
+						break;
 					default:
 						if (import.meta.env.DEV) {
 							console.warn('[ChatService] Unknown SSE event type:', eventType);
@@ -647,6 +663,73 @@ export class ChatService {
 			} catch (e) {
 				console.error('[ChatService] Error parsing typed SSE event:', eventType, e);
 			}
+		};
+
+		// Merged-orchestration tool dispatch. The proxy emits a `tool-execute`
+		// event per client tool call it wants the webui to handle (MCP tools
+		// live in the browser); we run the call locally and POST the result
+		// back to /api/tool-callback so the proxy can resume the unified loop.
+		const handleToolExecuteEvent = async (data: {
+			correlation_id: string;
+			name: string;
+			server_alias: string;
+			tool_name_local: string;
+			args: Record<string, unknown>;
+		}): Promise<void> => {
+			const sid = mergedOrchestrationStore.sessionId;
+			const token = mergedOrchestrationStore.sessionToken;
+			if (!sid || !token) {
+				console.warn('[ChatService] tool-execute received but no session registered');
+				return;
+			}
+			const startedAt = performance.now();
+			let body: {
+				ok: boolean;
+				content: string;
+				sources: unknown[];
+				artifacts: unknown[];
+				error_code: string | null;
+				client_latency_ms: number;
+			};
+			try {
+				const result = await mcpStore.executeToolByName(data.tool_name_local, data.args);
+				body = {
+					ok: !result.isError,
+					content: result.content,
+					sources: [],
+					artifacts: [],
+					error_code: result.isError ? 'tool_error' : null,
+					client_latency_ms: Math.round(performance.now() - startedAt)
+				};
+			} catch (e) {
+				console.warn('[ChatService] tool-execute dispatch failed', e);
+				body = {
+					ok: false,
+					content: e instanceof Error ? e.message : String(e),
+					sources: [],
+					artifacts: [],
+					error_code: 'tool_error',
+					client_latency_ms: Math.round(performance.now() - startedAt)
+				};
+			}
+			try {
+				await fetch(`${base}/api/tool-callback/${sid}/${data.correlation_id}`, {
+					method: 'POST',
+					headers: {
+						'Content-Type': 'application/json',
+						'X-Session-Token': token
+					},
+					body: JSON.stringify(body)
+				});
+			} catch (e) {
+				console.warn('[ChatService] tool-callback POST failed', e);
+			}
+		};
+
+		const handleToolExecuteCancelEvent = (data: { correlation_id: string }): void => {
+			// Phase 1: log only. R14.5 wires AbortSignal propagation per
+			// correlation_id so an in-flight MCP call can be cancelled here.
+			console.info('[ChatService] tool-execute-cancel', data.correlation_id);
 		};
 
 		try {
