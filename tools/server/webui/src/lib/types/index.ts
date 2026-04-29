@@ -125,6 +125,8 @@ export type {
 	ServerStatus,
 	ToolCallParams,
 	ToolExecutionResult,
+	MCPRawContentPart,
+	MCPRawToolCallResult,
 	ServerBuiltinToolInfo,
 	Tool,
 	Prompt,

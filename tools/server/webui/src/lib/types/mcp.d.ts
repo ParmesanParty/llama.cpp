@@ -252,9 +252,40 @@ export interface ToolCallParams {
 	arguments: Record<string, unknown>;
 }
 
+export interface MCPRawContentPart {
+	type: string;
+	text?: string;
+	data?: string;
+	mimeType?: string;
+	resource?: {
+		uri: string;
+		text?: string;
+		mimeType?: string;
+	};
+}
+
+export interface MCPRawToolCallResult {
+	content: MCPRawContentPart[];
+	isError?: boolean;
+	_meta?: {
+		// Origin: untrusted MCP server. Validate at the use site
+		// (tool-result-extractor.ts) rather than trusting the shape here.
+		sources?: unknown[];
+		[key: string]: unknown;
+	};
+}
+
 export interface ToolExecutionResult {
 	content: string;
 	isError: boolean;
+	/**
+	 * Underlying MCP-shape raw response. tool-result-extractor mines this for
+	 * sources/artifacts via result._meta. Builtin tools called via
+	 * /api/tools/execute synthesize a minimal raw with a single text content
+	 * part (sources/artifacts arrive separately via the typed SSE event
+	 * stream); MCP tools forward the server's actual response shape.
+	 */
+	raw: MCPRawToolCallResult;
 }
 
 export interface ServerBuiltinToolInfo {

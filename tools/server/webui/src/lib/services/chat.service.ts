@@ -6,6 +6,8 @@ import { mcpStore } from '$lib/stores/mcp.svelte';
 import { base } from '$app/paths';
 import { buildChatRequest } from './chat-request-builder';
 import { shouldRetryAfter410 } from './chat-410-recovery';
+import { extractToolResult } from './tool-result-extractor';
+import type { ExtractedToolResult } from './tool-result-extractor';
 import {
 	ATTACHMENT_LABEL_PDF_FILE,
 	ATTACHMENT_LABEL_MCP_PROMPT,
@@ -582,8 +584,8 @@ export class ChatService {
 		interface ToolCallbackBody {
 			ok: boolean;
 			content: string;
-			sources: unknown[];
-			artifacts: unknown[];
+			sources: ExtractedToolResult['sources'];
+			artifacts: ExtractedToolResult['artifacts'];
 			error_code: string | null;
 			client_latency_ms: number;
 		}
@@ -777,11 +779,12 @@ export class ChatService {
 					data.args,
 					ctrl.signal
 				);
+				const extracted = extractToolResult(result.raw);
 				body = {
 					ok: !result.isError,
-					content: result.content,
-					sources: [],
-					artifacts: [],
+					content: extracted.content,
+					sources: extracted.sources,
+					artifacts: extracted.artifacts,
 					error_code: result.isError ? 'tool_error' : null,
 					client_latency_ms: Math.round(performance.now() - startedAt)
 				};

@@ -1,7 +1,19 @@
 import { apiFetch } from '$lib/utils';
 import { API_TOOLS } from '$lib/constants';
 import { ToolResponseField } from '$lib/enums';
-import type { ToolExecutionResult, ServerBuiltinToolInfo } from '$lib/types';
+import type { MCPRawToolCallResult, ToolExecutionResult, ServerBuiltinToolInfo } from '$lib/types';
+
+/**
+ * Wrap a builtin-tool flat response in a minimal MCP-shape raw result so the
+ * ToolExecutionResult contract holds. Builtin sources/artifacts arrive via
+ * typed SSE events, not _meta — so the synthesized raw carries content only.
+ */
+function synthesizeRaw(content: string, isError: boolean): MCPRawToolCallResult {
+	return {
+		content: [{ type: 'text', text: content }],
+		isError
+	};
+}
 
 export class ToolsService {
 	/**
@@ -28,13 +40,16 @@ export class ToolsService {
 		});
 
 		if (ToolResponseField.ERROR in result) {
-			return { content: String(result[ToolResponseField.ERROR]), isError: true };
+			const content = String(result[ToolResponseField.ERROR]);
+			return { content, isError: true, raw: synthesizeRaw(content, true) };
 		}
 
 		if (ToolResponseField.PLAIN_TEXT in result) {
-			return { content: String(result[ToolResponseField.PLAIN_TEXT]), isError: false };
+			const content = String(result[ToolResponseField.PLAIN_TEXT]);
+			return { content, isError: false, raw: synthesizeRaw(content, false) };
 		}
 
-		return { content: JSON.stringify(result), isError: false };
+		const content = JSON.stringify(result);
+		return { content, isError: false, raw: synthesizeRaw(content, false) };
 	}
 }
