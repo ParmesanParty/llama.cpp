@@ -1,7 +1,10 @@
 <script lang="ts">
 	import { Search, Cloud, Code, Image, Globe } from '@lucide/svelte';
 	import SyntaxHighlightedCode from '$lib/components/app/content/SyntaxHighlightedCode.svelte';
+	import { DialogChatAttachmentsPreview } from '$lib/components/app';
+	import { AttachmentType } from '$lib/enums';
 	import type { ApiToolArtifactPayload } from '$lib/types';
+	import type { DatabaseMessageExtraImageFile } from '$lib/types/database';
 
 	interface Props {
 		tool: string;
@@ -61,6 +64,22 @@
 	let imageArtifacts = $derived(
 		(artifacts ?? []).filter((a) => a.kind === 'image')
 	);
+
+	let previewOpen = $state(false);
+	let previewAttachment = $state<DatabaseMessageExtraImageFile | null>(null);
+
+	function openArtifactPreview(artifact: ApiToolArtifactPayload) {
+		previewAttachment = {
+			type: AttachmentType.IMAGE,
+			name: artifact.name,
+			alt: artifact.alt,
+			base64Url: artifact.url ?? `data:${artifact.mime};base64,${artifact.data_b64}`,
+			width: artifact.width,
+			height: artifact.height,
+			url: artifact.url
+		};
+		previewOpen = true;
+	}
 
 	// code_exec gets a detached, syntax-highlighted block (sibling of the
 	// chip) instead of the bespoke monospace span nested inside the pill.
@@ -181,24 +200,30 @@
 		<div class="tool-chip-artifacts">
 			{#each imageArtifacts as artifact (artifact.name)}
 				{@const src = artifact.url ?? `data:${artifact.mime};base64,${artifact.data_b64}`}
-				<a
-					href={src}
-					target="_blank"
-					rel="noopener noreferrer"
+				<button
+					type="button"
 					class="artifact-link"
-					aria-label="Open {artifact.name} in new tab"
+					aria-label="Open {artifact.name} preview"
+					onclick={() => openArtifactPreview(artifact)}
 				>
 					<img
 						{src}
-						alt={artifact.name}
+						alt={artifact.alt ?? artifact.name}
 						class="artifact-thumb"
 						loading="lazy"
 					/>
-				</a>
+				</button>
 			{/each}
 		</div>
 	{/if}
 </div>
+
+{#if previewAttachment}
+	<DialogChatAttachmentsPreview
+		bind:open={previewOpen}
+		attachments={[previewAttachment]}
+	/>
+{/if}
 
 <style>
 	.tool-chip-wrapper {
@@ -348,10 +373,20 @@
 		overflow: hidden;
 		border: 1px solid var(--muted);
 		transition: border-color 150ms ease;
+		padding: 0;
+		background: transparent;
+		color: inherit;
+		font: inherit;
+		cursor: pointer;
 	}
 
 	.artifact-link:hover {
 		border-color: color-mix(in oklch, var(--muted) 50%, var(--foreground) 15%);
+	}
+
+	.artifact-link:focus-visible {
+		outline: 2px solid var(--ring, var(--foreground));
+		outline-offset: 2px;
 	}
 
 	.artifact-thumb {
