@@ -357,6 +357,8 @@
 {:else}
 	<div
 		class="flex h-full flex-col"
+		role="region"
+		aria-label="Chat with file drop"
 		ondragenter={handleDragEnter}
 		ondragleave={handleDragLeave}
 		ondragover={handleDragOver}
