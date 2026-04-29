@@ -39,6 +39,7 @@
 	import { isFileTypeSupported, filterFilesByModalities } from '$lib/utils';
 	import { parseFilesToMessageExtras, processFilesToChatUploaded } from '$lib/utils/browser-only';
 	import { onMount } from 'svelte';
+	import { slide } from 'svelte/transition';
 
 	let { showCenteredEmpty = false } = $props();
 
@@ -355,84 +356,95 @@
 	<ServerLoadingSplash />
 {:else}
 	<div
-		bind:this={chatScrollContainer}
-		aria-label="Chat interface with file drop zone"
-		class="flex h-full flex-col-reverse overflow-y-auto px-4 md:px-6"
+		class="flex h-full flex-col"
 		ondragenter={handleDragEnter}
 		ondragleave={handleDragLeave}
 		ondragover={handleDragOver}
 		ondrop={handleDrop}
-		onscroll={handleScroll}
-		role="main"
 	>
-		<div class="flex grow flex-col pt-14">
-			{#if !isEmpty}
-				<ChatMessages
-					messages={activeMessages()}
-					onUserAction={() => {
-						autoScroll.enable();
-						autoScroll.scrollToBottom();
-					}}
-				/>
-			{/if}
-
+		{#if !isEmpty}
 			<div
-				class="pointer-events-none {isEmpty
-					? 'absolute bottom-[calc(50dvh-7rem)]'
-					: 'sticky bottom-4'} right-4 left-4 mt-auto pt-16 transition-all duration-200"
+				bind:this={chatScrollContainer}
+				aria-label="Chat interface with file drop zone"
+				class="flex min-h-0 flex-1 flex-col-reverse overflow-y-auto px-4 md:px-6"
+				onscroll={handleScroll}
+				role="main"
 			>
-				{#if isEmpty}
-					<div class="mb-8 px-4 text-center" use:fadeInView={{ duration: 300 }}>
-						<h1 class="mb-2 text-2xl font-semibold tracking-tight md:text-3xl">Hello there</h1>
-
-						<p class="text-muted-foreground md:text-lg">
-							{serverStore.props?.modalities?.audio
-								? 'Record audio, type a message '
-								: 'Type a message'} or upload files to get started
-						</p>
-					</div>
-				{/if}
-
-				{#if page.params.id}
-					<ChatScreenProcessingInfo />
-				{/if}
-
-				{#if hasPropsError}
-					<div
-						class="pointer-events-auto mx-auto mb-4 max-w-[48rem] px-1"
-						use:fadeInView={{ y: 10, duration: 250 }}
-					>
-						<Alert.Root variant="destructive">
-							<AlertTriangle class="h-4 w-4" />
-							<Alert.Title class="flex items-center justify-between">
-								<span>Server unavailable</span>
-								<button
-									onclick={() => serverStore.fetch()}
-									disabled={isServerLoading}
-									class="flex items-center gap-1.5 rounded-lg bg-destructive/20 px-2 py-1 text-xs font-medium hover:bg-destructive/30 disabled:opacity-50"
-								>
-									<RefreshCw class="h-3 w-3 {isServerLoading ? 'animate-spin' : ''}" />
-									{isServerLoading ? 'Retrying...' : 'Retry'}
-								</button>
-							</Alert.Title>
-							<Alert.Description>{serverError()}</Alert.Description>
-						</Alert.Root>
-					</div>
-				{/if}
-
-				<div class="conversation-chat-form pointer-events-auto rounded-t-3xl">
-					<ChatScreenForm
-						disabled={hasPropsError || isEditing()}
-						{initialMessage}
-						isLoading={isCurrentConversationLoading}
-						onFileRemove={handleFileRemove}
-						onFileUpload={handleFileUpload}
-						onSend={handleSendMessage}
-						onStop={() => chatStore.stopGeneration()}
-						onSystemPromptAdd={handleSystemPromptAdd}
-						bind:uploadedFiles
+				<div class="flex grow flex-col pt-14">
+					<ChatMessages
+						messages={activeMessages()}
+						onUserAction={() => {
+							autoScroll.enable();
+							autoScroll.scrollToBottom();
+						}}
 					/>
 				</div>
+			</div>
+		{:else}
+			<div
+				aria-label="Chat interface with file drop zone"
+				class="flex min-h-0 flex-1 flex-col items-center justify-center px-4 md:px-6"
+				role="main"
+			>
+				<div class="mb-8 px-4 text-center" use:fadeInView={{ duration: 300 }}>
+					<h1 class="mb-2 text-2xl font-semibold tracking-tight md:text-3xl">Hello there</h1>
+
+					<p class="text-muted-foreground md:text-lg">
+						{serverStore.props?.modalities?.audio
+							? 'Record audio, type a message '
+							: 'Type a message'} or upload files to get started
+					</p>
+				</div>
+			</div>
+		{/if}
+
+		<!-- Form area: always a shrink-0 sibling outside the scroll container.
+		     iOS Safari miscalculates position:sticky inside overflow containers
+		     when the virtual keyboard resizes the viewport, painting the form
+		     outside the visible clipping rect. Keeping the form as a flex
+		     sibling avoids the bug. -->
+		<div
+			class="chat-form-area shrink-0 px-4 md:px-6"
+			class:scroll-up={autoScroll.userScrolledUp}
+			in:slide={{ duration: 150, axis: 'y' }}
+		>
+			{#if page.params.id && !isEmpty}
+				<ChatScreenProcessingInfo />
+			{/if}
+
+			{#if hasPropsError}
+				<div class="mx-auto mb-4 max-w-[48rem] px-1" use:fadeInView={{ y: 10, duration: 250 }}>
+					<Alert.Root variant="destructive">
+						<AlertTriangle class="h-4 w-4" />
+						<Alert.Title class="flex items-center justify-between">
+							<span>Server unavailable</span>
+							<button
+								onclick={() => serverStore.fetch()}
+								disabled={isServerLoading}
+								class="flex items-center gap-1.5 rounded-lg bg-destructive/20 px-2 py-1 text-xs font-medium hover:bg-destructive/30 disabled:opacity-50"
+							>
+								<RefreshCw class="h-3 w-3 {isServerLoading ? 'animate-spin' : ''}" />
+								{isServerLoading ? 'Retrying...' : 'Retry'}
+							</button>
+						</Alert.Title>
+						<Alert.Description>{serverError()}</Alert.Description>
+					</Alert.Root>
+				</div>
+			{/if}
+
+			<div class="conversation-chat-form rounded-t-3xl">
+				<ChatScreenForm
+					disabled={hasPropsError || isEditing()}
+					{initialMessage}
+					isLoading={isCurrentConversationLoading}
+					onFileRemove={handleFileRemove}
+					onFileUpload={handleFileUpload}
+					onSend={handleSendMessage}
+					onStop={() => chatStore.stopGeneration()}
+					onSystemPromptAdd={handleSystemPromptAdd}
+					showHelperText={false}
+					bind:uploadedFiles
+				/>
 			</div>
 		</div>
 	</div>
@@ -469,3 +481,27 @@
 	open={Boolean(activeErrorDialog)}
 	type={activeErrorDialog?.type ?? ErrorDialogType.SERVER}
 />
+
+<style>
+	.chat-form-area {
+		position: relative;
+
+		&::before {
+			content: '';
+			position: absolute;
+			bottom: 100%;
+			left: 0;
+			right: 0;
+			height: 2.5rem;
+			background: linear-gradient(to top, var(--background), transparent);
+			pointer-events: none;
+			z-index: 10;
+			opacity: 0;
+			transition: opacity 120ms ease-out;
+		}
+
+		&.scroll-up::before {
+			opacity: 1;
+		}
+	}
+</style>
