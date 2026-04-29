@@ -20,6 +20,7 @@
  * @see mcpStore in stores/mcp.svelte.ts for MCP operations
  */
 
+import { toast } from 'svelte-sonner';
 import { ChatService } from '$lib/services';
 import { config } from '$lib/stores/settings.svelte';
 import { mcpStore } from '$lib/stores/mcp.svelte';
@@ -394,9 +395,17 @@ class AgenticStore {
 		this._continueResolvers.delete(conversationId);
 		this._steeringMessages.delete(conversationId);
 
-		// Ensure built-in tools are fetched before checking if agentic is enabled
+		// Ensure built-in tools are fetched before checking if agentic is enabled.
+		// Surface transient fetch errors instead of letting the flow degrade
+		// silently to MCP-only tools — the user otherwise has no way to tell
+		// why web_search/code_exec/image_gen aren't being offered. The 404
+		// case (server started without /tools) is tracked separately via
+		// `_toolsEndpointUnreachable` and isn't a transient error.
 		if (toolsStore.builtinTools.length === 0 && !toolsStore.loading) {
 			await toolsStore.fetchBuiltinTools();
+			if (toolsStore.error && !toolsStore.isToolsEndpointUnreachable) {
+				toast.warning(`Built-in tools unavailable: ${toolsStore.error}`);
+			}
 		}
 
 		const agenticConfig = this.getConfig(config(), perChatOverrides);
