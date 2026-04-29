@@ -47,11 +47,12 @@ import type {
 import type {
 	ApiCompactionMetadata,
 	ApiProcessingState,
+	ApiToolArtifactsEvent,
 	ConversationCompaction,
 	DatabaseMessage,
 	DatabaseMessageExtra
 } from '$lib/types';
-import { ErrorDialogType, MessageRole, MessageType } from '$lib/enums';
+import { AttachmentType, ErrorDialogType, MessageRole, MessageType } from '$lib/enums';
 
 interface ConversationStateEntry {
 	lastAccessed: number;
@@ -656,6 +657,21 @@ class ChatStore {
 			conversationsStore.updateMessageAtIndex(idx, { content: streamedContent });
 		};
 
+		// Append extras onto a message and persist.  Shared between the
+		// upstream agentic-flow onAttachments hook (which fires when the
+		// orchestrator's extractBase64Attachments finds inline base64 in
+		// a tool result string) and the parmesan tool_artifacts SSE handler
+		// (which fires when the proxy emits a typed artifact event mid-stream).
+		const pushExtras = (messageId: string, extras: DatabaseMessageExtra[]): void => {
+			if (!extras.length) return;
+			const idx = conversationsStore.findMessageIndex(messageId);
+			if (idx === -1) return;
+			const msg = conversationsStore.activeMessages[idx];
+			const updatedExtras = [...(msg.extra || []), ...extras];
+			conversationsStore.updateMessageAtIndex(idx, { extra: updatedExtras });
+			DatabaseService.updateMessage(messageId, { extra: updatedExtras }).catch(console.error);
+		};
+
 		const cleanupStreamingState = () => {
 			this.setStreamingActive(false);
 			this.setChatLoading(convId, false);
@@ -684,15 +700,7 @@ class ChatStore {
 				const idx = conversationsStore.findMessageIndex(currentMessageId);
 				conversationsStore.updateMessageAtIndex(idx, { toolCalls: JSON.stringify(toolCalls) });
 			},
-			onAttachments: (messageId: string, extras: DatabaseMessageExtra[]) => {
-				if (!extras.length) return;
-				const idx = conversationsStore.findMessageIndex(messageId);
-				if (idx === -1) return;
-				const msg = conversationsStore.activeMessages[idx];
-				const updatedExtras = [...(msg.extra || []), ...extras];
-				conversationsStore.updateMessageAtIndex(idx, { extra: updatedExtras });
-				DatabaseService.updateMessage(messageId, { extra: updatedExtras }).catch(console.error);
-			},
+			onAttachments: pushExtras,
 			onModel: (modelName: string) => recordModel(modelName),
 			onTurnComplete: (intermediateTimings: ChatMessageTimings) => {
 				// Update the first assistant message with cumulative agentic timings
@@ -862,6 +870,22 @@ class ChatStore {
 					compactedMessageCount: metadata.compacted_message_count,
 					timestamp: Date.now()
 				});
+			},
+			onToolArtifacts: (event: ApiToolArtifactsEvent) => {
+				// Map the artifact payload to a DatabaseMessageExtraImageFile
+				// and attach it to the assistant message currently streaming.
+				// Non-image artifact kinds short-circuit (no other kinds shipped
+				// yet — kept as a guard for forward compatibility).
+				if (event.artifact.kind !== 'image') return;
+				const extra: DatabaseMessageExtra = {
+					type: AttachmentType.IMAGE,
+					name: event.artifact.name,
+					base64Url: `data:${event.artifact.mime};base64,${event.artifact.data_b64}`,
+					...(event.artifact.width !== undefined ? { width: event.artifact.width } : {}),
+					...(event.artifact.height !== undefined ? { height: event.artifact.height } : {}),
+					...(event.artifact.url ? { url: event.artifact.url } : {})
+				};
+				pushExtras(currentMessageId, [extra]);
 			}
 		};
 
