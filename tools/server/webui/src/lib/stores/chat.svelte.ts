@@ -683,6 +683,15 @@ class ChatStore {
 		// orchestrator's extractBase64Attachments finds inline base64 in
 		// a tool result string) and the parmesan tool_artifacts SSE handler
 		// (which fires when the proxy emits a typed artifact event mid-stream).
+		// Snapshot the extras through JSON before handing to Dexie: msg.extra
+		// items already in the store are wrapped in $state proxies, and IDB's
+		// structured-clone rejects those with DataCloneError.  Without the
+		// snapshot, the second tool_artifacts event onward (with one or more
+		// proxied entries already in updatedExtras) silently throws, and the
+		// onAssistantTurnComplete partial-update later read-modify-writes from
+		// the stale on-disk record — collapsing message.extra back to whatever
+		// the last successful (proxy-free) put captured, typically the very
+		// first artifact only.
 		const pushExtras = (messageId: string, extras: DatabaseMessageExtra[]): void => {
 			if (!extras.length) return;
 			const idx = conversationsStore.findMessageIndex(messageId);
@@ -690,7 +699,9 @@ class ChatStore {
 			const msg = conversationsStore.activeMessages[idx];
 			const updatedExtras = [...(msg.extra || []), ...extras];
 			conversationsStore.updateMessageAtIndex(idx, { extra: updatedExtras });
-			DatabaseService.updateMessage(messageId, { extra: updatedExtras }).catch(console.error);
+			DatabaseService.updateMessage(messageId, {
+				extra: JSON.parse(JSON.stringify(updatedExtras))
+			}).catch(console.error);
 		};
 
 		const cleanupStreamingState = () => {
