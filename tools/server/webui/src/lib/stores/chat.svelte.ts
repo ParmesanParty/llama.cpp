@@ -1896,7 +1896,24 @@ class ChatStore {
 				{ ...assistantMessage, content: assistantContent }
 			];
 
-			await ChatService.preEncode(messagesWithAssistant, model, excludeReasoning, signal);
+			const enableThinking = !!conversationsStore.activeThinkingEnabled;
+			const preserveThinking = !!conversationsStore.activePreserveThinking;
+			const thinkingOverrides =
+				enableThinking && settingsStore.hasThinkingOverrides
+					? settingsStore.thinkingOverrides
+					: undefined;
+			const custom = config().custom || undefined;
+
+			await ChatService.preEncode(
+				messagesWithAssistant,
+				model,
+				excludeReasoning,
+				signal,
+				enableThinking,
+				preserveThinking,
+				thinkingOverrides,
+				custom
+			);
 		} catch (err) {
 			if (!isAbortError(err)) {
 				console.warn('[ChatStore] Pre-encode failed:', err);
