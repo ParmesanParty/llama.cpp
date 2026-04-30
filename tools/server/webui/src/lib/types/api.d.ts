@@ -296,12 +296,6 @@ export interface ApiSourcesEvent {
 	final?: boolean;
 }
 
-export interface ApiToolHealthEvent {
-	tool: string;
-	state: string;
-	reason: string;
-}
-
 export interface ApiToolArtifactPayload {
 	/** Discriminator. Currently only "image"; "file" reserved for future use. */
 	kind: 'image' | 'file';

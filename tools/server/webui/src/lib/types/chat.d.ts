@@ -7,8 +7,7 @@ import type {
 	ApiToolArgStreamEvent,
 	ApiToolArtifactsEvent,
 	ApiRetractionEvent,
-	ApiSourcesEvent,
-	ApiToolHealthEvent
+	ApiSourcesEvent
 } from './api';
 
 export interface ChatUploadedFile {
@@ -126,7 +125,6 @@ export interface ChatStreamCallbacks {
 	onToolStatus?: (event: ApiToolStatusEvent) => void;
 	onRetraction?: (event: ApiRetractionEvent) => void;
 	onSources?: (event: ApiSourcesEvent) => void;
-	onToolHealth?: (event: ApiToolHealthEvent) => void;
 	onToolArtifacts?: (event: ApiToolArtifactsEvent) => void;
 	onToolArgStream?: (event: ApiToolArgStreamEvent) => void;
 }

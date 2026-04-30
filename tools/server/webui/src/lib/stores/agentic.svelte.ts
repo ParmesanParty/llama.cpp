@@ -513,7 +513,6 @@ class AgenticStore {
 			onToolStatus,
 			onRetraction,
 			onSources,
-			onToolHealth,
 			onToolArtifacts,
 			onToolArgStream
 		} = callbacks;
@@ -590,7 +589,6 @@ class AgenticStore {
 						onToolStatus,
 						onRetraction,
 						onSources,
-						onToolHealth,
 						onToolArtifacts,
 						onToolArgStream,
 						onChunk: (chunk: string) => {

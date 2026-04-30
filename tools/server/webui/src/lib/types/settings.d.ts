@@ -8,8 +8,7 @@ import type {
 	ApiToolArgStreamEvent,
 	ApiToolArtifactsEvent,
 	ApiRetractionEvent,
-	ApiSourcesEvent,
-	ApiToolHealthEvent
+	ApiSourcesEvent
 } from './api';
 import type { ParameterSource, SyncableParameterType, SettingsFieldType } from '$lib/enums';
 import type { Icon } from '@lucide/svelte';
@@ -87,7 +86,6 @@ export interface SettingsChatServiceOptions {
 	onToolStatus?: (event: ApiToolStatusEvent) => void;
 	onRetraction?: (event: ApiRetractionEvent) => void;
 	onSources?: (event: ApiSourcesEvent) => void;
-	onToolHealth?: (event: ApiToolHealthEvent) => void;
 	onToolArtifacts?: (event: ApiToolArtifactsEvent) => void;
 	onToolArgStream?: (event: ApiToolArgStreamEvent) => void;
 }

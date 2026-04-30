@@ -58,7 +58,6 @@ export const STREAM_FEATURE_TOKENS = [
 	'retraction',
 	'compaction',
 	'sources',
-	'tool-health',
 	'tool-artifacts',
 	'tool-arg-stream'
 ] as const;

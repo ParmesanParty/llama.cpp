@@ -12,9 +12,6 @@
  *                    so the renderer can split per-iteration reasoning).
  *   onRetraction     pushEvent at current content offset.
  *   onSources        pushEvent at offset 0 (footer is sticky-bottom).
- *   onToolHealth     console.warn only — does NOT accumulate (tool health is
- *                    a sidecar concern handled by toolHealthStore via
- *                    /api/events, not per-message).
  *   onCompaction     resolves the boundary message id against sentMessages
  *                    (which may include the synthetic "compaction-summary"
  *                    placeholder) and stamps it on the conversation.
@@ -30,7 +27,6 @@ import type {
 	ApiToolArgStreamEvent,
 	ApiRetractionEvent,
 	ApiSourcesEvent,
-	ApiToolHealthEvent,
 	ApiToolArtifactsEvent,
 	ApiCompactionMetadata,
 	StreamEvent,
@@ -130,9 +126,6 @@ export function createStreamEventHandlers(ctx: StreamEventContext) {
 				offset: 0,
 				data: event as unknown as Record<string, unknown>
 			});
-		},
-		onToolHealth: (event: ApiToolHealthEvent) => {
-			console.warn(`[tool-health] ${event.tool}: ${event.state} — ${event.reason}`);
 		},
 		onCompaction: (metadata: ApiCompactionMetadata) => {
 			const msgs = ctx.sentMessages() ?? ctx.activeMessages();

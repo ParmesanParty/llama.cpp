@@ -114,7 +114,6 @@ export interface StreamEvent {
 		| 'tool_arg_stream'
 		| 'retraction'
 		| 'sources'
-		| 'tool_health'
 		| 'compaction'
 		| 'tool_artifacts';
 	offset: number;

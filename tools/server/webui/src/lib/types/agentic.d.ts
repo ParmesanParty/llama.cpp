@@ -9,7 +9,6 @@ import type {
 	ApiToolStatusEvent,
 	ApiRetractionEvent,
 	ApiSourcesEvent,
-	ApiToolHealthEvent,
 	ApiToolArtifactsEvent,
 	ApiToolArgStreamEvent
 } from './api';
@@ -132,7 +131,6 @@ export interface AgenticFlowCallbacks {
 	onToolStatus?: (event: ApiToolStatusEvent) => void;
 	onRetraction?: (event: ApiRetractionEvent) => void;
 	onSources?: (event: ApiSourcesEvent) => void;
-	onToolHealth?: (event: ApiToolHealthEvent) => void;
 	onToolArtifacts?: (event: ApiToolArtifactsEvent) => void;
 	onToolArgStream?: (event: ApiToolArgStreamEvent) => void;
 }
